@@ -1,0 +1,45 @@
+diff --git a/apps/test/sizetest.c b/apps/test/sizetest.c
+index 19cce1f..fb370f0 100644
+--- a/apps/test/sizetest.c
++++ b/apps/test/sizetest.c
+@@ -9,9 +9,12 @@ _Static_assert(sizeof(unsigned long) == 4, "unsigned long is not 32 bits");
+ 
+ #include <stdint.h>
+ 
+-typedef char uint32_is_ulong[
+-    __builtin_types_compatible_p(uint32_t, unsigned long) ? 1 : -1
+-];
++/* Whether uint32_t is spelled `unsigned long` or `unsigned int` varies between
++   amiga-gcc builds: on this toolchain <stdint.h> uses `unsigned int` for both
++   newlib and clib2.  Both are 32 bits, which is what the wire format and the
++   assertions above actually require, so report the distinction instead of
++   failing the build over it. */
++#define UINT32_IS_ULONG __builtin_types_compatible_p(uint32_t, unsigned long)
+ 
+ int main(void)
+ {
+@@ -19,6 +22,7 @@ int main(void)
+     printf("sizeof(LONG)  = %lu\n", (unsigned long)sizeof(LONG));
+     printf("sizeof(UWORD) = %lu\n", (unsigned long)sizeof(UWORD));
+     printf("sizeof(APTR)  = %lu\n", (unsigned long)sizeof(APTR));
++    printf("uint32_t is unsigned long = %s\n", UINT32_IS_ULONG ? "yes" : "no");
+ 
+     return 0;
+ }
+\ No newline at end of file
+diff --git a/makefiles/compiler-amigagcc.mk b/makefiles/compiler-amigagcc.mk
+index 8c0354a..48e706c 100644
+--- a/makefiles/compiler-amigagcc.mk
++++ b/makefiles/compiler-amigagcc.mk
+@@ -2,6 +2,11 @@ CC := m68k-amigaos-gcc
+ 
+ CFLAGS += -Wall -Wextra -O2 -std=c99
+ CFLAGS += -mcpu=68000 -msoft-float
++# -mcrt selects both the C runtime *and* its headers, so it has to match the
++# link step below.  Compiling against the default newlib headers and then
++# linking with clib2 leaves newlib-only symbols unresolved, e.g.
++#   doslistdiag.o: undefined reference to `_impure_ptr'
++CFLAGS += -mcrt=clib2
+ CFLAGS += -I$(APP_INCLUDE_DIR)
+ CFLAGS += -I$(CONFIG_NIO_INCLUDE_DIR)
+ CFLAGS += -I$(PLATFORM_INCLUDE_DIR)

@@ -1,0 +1,8 @@
+# Licensed AmigaOS data -- never commit
+assets/
+
+# Large build trees / clones
+workspace/
+toolchain-src/
+logs/*.log
+logs/shots/

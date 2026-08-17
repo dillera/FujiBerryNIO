@@ -1,0 +1,89 @@
+diff --git a/configs/amiga/workbenches.yaml b/configs/amiga/workbenches.yaml
+index 87cde2a..033c880 100644
+--- a/configs/amiga/workbenches.yaml
++++ b/configs/amiga/workbenches.yaml
+@@ -1,6 +1,17 @@
+ default: wb3.2
+ 
+ profiles:
++
++  wb3.1:
++    build_test_disk: true
++    kickstart: ${AMIBERRY_ASSET_ROOT}/ROM/kick31.rom
++    settings:
++      cpu_type: 68000
++      chipmem_size: 512
++      fastmem_size: 8
++      cpu_compatible: true
++      cachesize: 0
++
+   wb3.2:
+     build_test_disk: true
+     kickstart: ${AMIBERRY_ASSET_ROOT}/ROM/kickCDTVa1000a500a2000a600.rom
+diff --git a/scripts/build-amiga-test-disk b/scripts/build-amiga-test-disk
+index 79e20c1..98d9aa4 100755
+--- a/scripts/build-amiga-test-disk
++++ b/scripts/build-amiga-test-disk
+@@ -24,6 +24,17 @@ def run_xdf(image: Path, *commands: str) -> None:
+     subprocess.run([*xdf_tool(), str(image), *commands], check=True)
+ 
+ 
++def run_xdf_optional(image: Path, *commands: str) -> None:
++    """Run an xdftool command whose target may legitimately be absent.
++
++    The WBStartup/Welcome first-run program is an AmigaOS 3.2 addition.  An
++    expanded 3.1 tree has WBStartup but no Welcome, so deleting it must not
++    fail the build.
++    """
++    subprocess.run([*xdf_tool(), str(image), *commands], check=False,
++                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++
+ def ignored_cd_content(_directory: str, names: list[str]) -> set[str]:
+     ignored = {"ADF", "GlowIconsCollection", "Labels", "ROM"}
+     for name in names:
+@@ -87,7 +98,11 @@ def main() -> int:
+     args.output.unlink(missing_ok=True)
+ 
+     with tempfile.TemporaryDirectory(prefix="amiga-test-disk-") as temp:
+-        staged_os = Path(temp) / "AmigaOS3.2"
++        # xdftool takes the volume name from the packed directory's name, so
++        # name the staging directory after the OS tree being installed rather
++        # than hardcoding 3.2.  A 3.1 image otherwise boots a volume labelled
++        # "AmigaOS3.2".
++        staged_os = Path(temp) / args.os_root.resolve().name
+         shutil.copytree(args.os_root, staged_os, ignore=ignored_cd_content)
+         run_xdf(args.output, "pack", str(staged_os), "ffs", f"size={args.size}")
+         # The licensed Workbench tree includes a first-run WBStartup program
+@@ -95,13 +110,17 @@ def main() -> int:
+         # requester.  Test images should boot directly to an usable
+         # Workbench; remove only this optional welcome program, not the rest
+         # of WBStartup.
+-        run_xdf(args.output, "delete", "WBStartup/Welcome")
+-        run_xdf(args.output, "delete", "WBStartup/Welcome.info")
++        run_xdf_optional(args.output, "delete", "WBStartup/Welcome")
++        run_xdf_optional(args.output, "delete", "WBStartup/Welcome.info")
+         boot_code = Path(temp) / "boot.bin"
+         run_xdf(args.boot_adf, "boot", "read", str(boot_code))
+         run_xdf(args.output, "boot", "write", str(boot_code))
+         serial_device = Path(temp) / "serial.device"
+         run_xdf(args.boot_adf, "read", "Devs/serial.device", str(serial_device))
++        # An expanded AmigaOS 3.1 tree already carries Devs/serial.device, and
++        # xdftool refuses to overwrite an existing node.  Remove it first so the
++        # copy taken from the boot ADF wins either way.
++        run_xdf_optional(args.output, "delete", "Devs/serial.device")
+         run_xdf(args.output, "write", str(serial_device), "Devs/serial.device")
+         run_xdf(args.output, "write", str(args.app), f"C/{args.app_name}")
+         if args.disk_device:
+@@ -151,6 +170,11 @@ def main() -> int:
+             marker_at = original.find(marker)
+             if marker_at < 0:
+                 raise SystemExit("licensed Startup-Sequence has no LoadWB marker")
++            # Split at the start of the line holding LoadWB, not at the word.
++            # AmigaOS 3.1 writes "C:LoadWB", so cutting at the word leaves the
++            # dangling "C:" glued to our first injected command and produces
++            # "C:C:Assign T: RAM:", which then fails at boot.
++            marker_at = original.rfind("\n", 0, marker_at) + 1
+             startup_text = original[:marker_at] + test_commands.rstrip() + "\n"
+             if args.no_workbench:
+                 # Protocol tests do not need Workbench.  End the boot CLI
