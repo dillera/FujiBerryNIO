@@ -47,6 +47,12 @@ if [ -f "$FNWEATHER_BUILD/fnweather" ] && [ -f "$FNWEATHER_BUILD/fnweather.info"
   install -m 0644 "$FNWEATHER_BUILD/fnweather" "$FNWEATHER_BUILD/fnweather.info" "$NIO_STAGE/"
 fi
 
+# FujiRealm (fujirealm-game-demo's amiga-client) with its icon, likewise.
+FUJIREALM_BUILD="${FUJIREALM_BUILD:-$PROJ/../fujirealm-game-demo/amiga-client/build}"
+if [ -f "$FUJIREALM_BUILD/FujiRealm" ] && [ -f "$FUJIREALM_BUILD/FujiRealm.info" ]; then
+  install -m 0644 "$FUJIREALM_BUILD/FujiRealm" "$FUJIREALM_BUILD/FujiRealm.info" "$NIO_STAGE/"
+fi
+
 echo "==> profile   : $PROFILE"
 echo "==> amiberry  : $AMIBERRY_BIN"
 echo "==> toolchain : $(command -v m68k-amigaos-gcc || echo 'NOT FOUND')"
