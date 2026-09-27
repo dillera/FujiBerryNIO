@@ -40,6 +40,13 @@ NIO_STAGE="$WS/build/amiga-artifacts/${PROFILE%%-*}/NIO"
 mkdir -p "$NIO_STAGE"
 install -m 0644 "$PROJ/tools/fversion/build/fversion" "$NIO_STAGE/fversion"
 
+# fnweather (fujinet-weather's amiga/ port) with its Workbench icon, when a
+# sibling checkout has been built (`make` in fujinet-weather/amiga).
+FNWEATHER_BUILD="${FNWEATHER_BUILD:-$PROJ/../fujinet-weather/amiga/build}"
+if [ -f "$FNWEATHER_BUILD/fnweather" ] && [ -f "$FNWEATHER_BUILD/fnweather.info" ]; then
+  install -m 0644 "$FNWEATHER_BUILD/fnweather" "$FNWEATHER_BUILD/fnweather.info" "$NIO_STAGE/"
+fi
+
 echo "==> profile   : $PROFILE"
 echo "==> amiberry  : $AMIBERRY_BIN"
 echo "==> toolchain : $(command -v m68k-amigaos-gcc || echo 'NOT FOUND')"
