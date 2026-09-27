@@ -31,6 +31,7 @@ PATCHES=(
   "0002-workspace-harness-fixes.patch:."
   "0003-driver-darwin-mkdtemp.patch:repos/fujinet-nio-driver"
   "0004-driver-nio-dosbase-null.patch:repos/fujinet-nio-driver"
+  "0005-fujinet-nio-tcp-connect-errno.patch:repos/fujinet-nio"
 )
 
 for entry in "${PATCHES[@]}"; do

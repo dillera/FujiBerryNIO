@@ -1,0 +1,22 @@
+diff --git a/src/platform/posix/tcp_socket_ops_posix.cpp b/src/platform/posix/tcp_socket_ops_posix.cpp
+index 0264642..f5c617e 100644
+--- a/src/platform/posix/tcp_socket_ops_posix.cpp
++++ b/src/platform/posix/tcp_socket_ops_posix.cpp
+@@ -107,7 +107,16 @@ public:
+         if (pr < 0) {
+             return false; // error, errno set
+         }
+-        return pr > 0; // true if ready, false if still connecting
++        if (pr == 0) {
++            // Still connecting. poll() leaves errno untouched on timeout, and
++            // step_connect() reads last_errno() after a false return: clear it
++            // so a stale value from an unrelated call is not taken as a
++            // connect failure (seen on macOS as an immediate IOError on the
++            // first write to a freshly opened tcp:// session).
++            errno = 0;
++            return false;
++        }
++        return true;
+     }
+ 
+     SSize send(int fd, const void* buf, std::size_t len) override

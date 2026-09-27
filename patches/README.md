@@ -11,6 +11,7 @@ with `git apply` inside the listed repo.
 | `0002` | `fujinet-nio-workspace` | Three harness bugs, below |
 | `0003` | `fujinet-nio-driver` | Native test uses `mkdtemp()` under strict `_POSIX_C_SOURCE`; macOS hides it without `_DARWIN_C_SOURCE` (the file already sets glibc's `_DEFAULT_SOURCE`) |
 | `0004` | `fujinet-nio-driver` | **`fujinet-nio.device` crashes Kickstart 1.3 on a 68000** — see below |
+| `0005` | `fujinet-nio` | Every `tcp://` session failed on macOS: `step_connect()` read a stale `errno` after `poll()` timed out (poll leaves errno untouched), so a connect still in progress was marked failed and the first write got an I/O error. `poll_connect_complete()` now clears errno when not yet ready |
 
 ## 0004: the Kickstart 1.3 crash (not macOS-specific)
 
