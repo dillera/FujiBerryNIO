@@ -32,6 +32,14 @@ if [ "$PROFILE" = wb13-a500 ] && [ -z "${AMIBERRY_FAST_FILE_SYSTEM:-}" ]; then
   export AMIBERRY_FAST_FILE_SYSTEM="$WS/images/FastFileSystem"
 fi
 
+# Add this repo's fversion to the profile's NIO: package (wb13-a500 -> wb13).
+# The workspace's artifact step only adds and replaces files, so it survives.
+# nix13 needs only Kickstart 1.x calls, so the same binary suits wb31 too.
+make -s -C "$PROJ/tools/fversion"
+NIO_STAGE="$WS/build/amiga-artifacts/${PROFILE%%-*}/NIO"
+mkdir -p "$NIO_STAGE"
+install -m 0644 "$PROJ/tools/fversion/build/fversion" "$NIO_STAGE/fversion"
+
 echo "==> profile   : $PROFILE"
 echo "==> amiberry  : $AMIBERRY_BIN"
 echo "==> toolchain : $(command -v m68k-amigaos-gcc || echo 'NOT FOUND')"

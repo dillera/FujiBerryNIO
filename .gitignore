@@ -6,3 +6,4 @@ workspace/
 toolchain-src/
 logs/*.log
 logs/shots/
+tools/*/build/

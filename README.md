@@ -52,6 +52,21 @@ cd workspace
 scripts/amiga-tests --amiga-env wb13 --amiga-machine a500-000 -k wb13 -v
 ```
 
+`05-run.sh` also puts `fversion` on `NIO:`. It lists the FujiNet devices as
+Exec has them registered, which 1.3's `Version` cannot do:
+
+```text
+1.NIO:> NIO:fversion
+exec.library 34.2
+fujinet-nio.device     0.5  open=0  at $00c296fc
+  id: fujinet-nio.device 0.9 (9.9.2026) © 2026 Mark Fisher
+fujinet-disk.device    not loaded
+fujinet-serial.device  not loaded
+```
+
+Note that the registered version (0.5) and the `$VER` string (0.9) of
+`fujinet-nio.device` currently disagree upstream.
+
 In an interactive WB1.3 session, install the drivers onto the HDF with
 `Execute NIO:Install-FujiNet-WB13`; see upstream's [testing doc][doc].
 
@@ -66,6 +81,7 @@ In an interactive WB1.3 session, install the drivers onto the HDF with
 | `config/amiga.env` | Licensed-media path template → `workspace/local/amiga.env` |
 | `patches/` | Fixes applied to upstream; see [`patches/README.md`](patches/README.md) |
 | `docs/` | Upstream bug report(s) drafted from this work |
+| `tools/fversion/` | `NIO:fversion` — FujiNet device versions as loaded in memory (WB1.3+) |
 | `workspace/` | Clone of fujinet-nio-workspace (not committed) |
 | `toolchain-src/` | Clone of bebbo's amiga-gcc build tree (not committed) |
 | `assets/amigaOS1.3/` | Generated WB1.3 HDF — **licensed data, not committed** |
