@@ -1,0 +1,32 @@
+diff --git a/amiga/nio.device/fujinet_nio_device.c b/amiga/nio.device/fujinet_nio_device.c
+index 1af5663..3b24a54 100644
+--- a/amiga/nio.device/fujinet_nio_device.c
++++ b/amiga/nio.device/fujinet_nio_device.c
+@@ -83,7 +83,12 @@ struct ExecBase *SysBase;
+ extern struct DosLibrary *DOSBase;
+ static struct fujinet_nio_device_base *directory_worker_base;
+ #elif !defined(FUJINET_NIO_NATIVE_TEST)
+-struct DosLibrary *DOSBase;
++/* Explicitly NULL, not a tentative definition: otherwise the link resolves
++ * DOSBase to libnix's auto-open entry, which is -1 until startup code opens
++ * dos.library. This device has no startup code (-nostartfiles), so the -1
++ * survived, the NULL test in open_backend() never fired, and KS 1.3 on a
++ * 68000 took an address error reading lib_Version through it. */
++struct DosLibrary *DOSBase = NULL;
+ static struct fujinet_nio_device_base *serial_worker_base;
+ 
+ /* On KS 1.3 CreateProc starts a BCPL seglist, rather than accepting an
+diff --git a/amiga/nio.device/fujinet_nio_directory_backend.c b/amiga/nio.device/fujinet_nio_directory_backend.c
+index 6995e73..e31b3a0 100644
+--- a/amiga/nio.device/fujinet_nio_directory_backend.c
++++ b/amiga/nio.device/fujinet_nio_directory_backend.c
+@@ -48,7 +48,8 @@ const char fujinet_nio_native_test_ver[] =
+ 
+ #ifdef __AMIGA__
+ extern struct ExecBase *SysBase;
+-struct DosLibrary *DOSBase;
++/* Explicitly NULL: a tentative definition links to libnix's auto-open -1. */
++struct DosLibrary *DOSBase = NULL;
+ #endif
+ 
+ static fn_packet_backend_t guard;

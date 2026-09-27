@@ -1,10 +1,13 @@
 # Amiberry + FujiNet NIO on macOS
 
 Reproducible setup for running the [fujinet-nio-workspace][ws] Amiga test stack
-on an Apple Silicon Mac, following [`docs/amiga/amiberry-testing.md`][doc]
-and adapting it where that document assumes Linux and licensed AmigaOS 3.2.
+on an Apple Silicon Mac, on two systems:
 
-Verified on **macOS 26.5.2 (arm64)**, Amiberry **8.3.0**, Homebrew 6.0.
+* **Workbench 1.3** — Kickstart 1.3 (34.5), A500, 68000, 512K chip + 512K slow
+* **Workbench 3.1** — Kickstart 3.1 (40.63), built by upstream's six-disk builder
+
+Verified on **macOS 26.5.2 (arm64)**, Amiberry **8.3.0**, workspace
+`ac1d791` (2026-09-27).
 
 [ws]: https://github.com/markjfisher/fujinet-nio-workspace
 [doc]: https://github.com/markjfisher/fujinet-nio-workspace/blob/master/docs/amiga/amiberry-testing.md
@@ -23,32 +26,34 @@ Amiberry TCP serial endpoint  127.0.0.1:23462   (serial_direct=true)
 FujiNet NIO (POSIX build)     127.0.0.1:65504   fujibus-tcp-debug
 ```
 
-The Amiga apps (`wifitest`, `fhost`, `fls`, `fmount`, …) are cross-compiled for
-m68k, packed into a bootable HDF next to an expanded AmigaOS tree, and booted in
-Amiberry. Their FujiBus traffic goes out the emulated serial port and into the
-host-side FujiNet NIO service.
-
-`serial_direct=true` matters: without it Amiberry's emulated serial reader drops
-bytes from binary FujiBus frames.
+Amiga drivers and apps are cross-compiled per Workbench **artifact profile**
+(`wb13` links the Kickstart 1.3 `nix13` runtime, `wb31` links `clib2`), packed
+into a test HDF or mounted read-only as `NIO:`, and talk FujiBus over the
+emulated serial port to the host-side FujiNet NIO service.
 
 ---
 
 ## Quick start
 
 ```bash
-scripts/01-install-toolchain.sh      # m68k-amigaos-gcc  (long: ~40-60 min)
-scripts/02-build-amigaos-tree.sh     # expand AmigaOS 3.1 ADFs -> assets/
-scripts/03-configure-workspace.sh    # write workspace local/config.env + wb3.1
-scripts/04-run.sh                    # build apps + HDF, boot in Amiberry
+scripts/01-install-toolchain.sh   # m68k-amigaos-gcc under ~/opt/amiga  (~40-60 min, once)
+scripts/02-clone-workspace.sh     # clone/update workspace + submodules, apply patches/
+scripts/03-configure-workspace.sh # local/*.env, build the WB3.1 env HDF
+scripts/04-build-wb13-hdf.sh      # build the bootable WB1.3 HDF + its E2E env
+scripts/05-run.sh                 # boot interactive Workbench 1.3 with NIO:
+PROFILE=wb31-a1200 scripts/05-run.sh   # ...or Workbench 3.1
 ```
 
-Once booted, open `System/Shell` in Workbench and run:
+Build the host service and Amiga stack, then run the WB1.3 E2E cases:
 
-```text
-wifitest
-fhost
-fls
+```bash
+cd workspace
+./scripts/build.sh fujinet-tcp-debug amiga
+scripts/amiga-tests --amiga-env wb13 --amiga-machine a500-000 -k wb13 -v
 ```
+
+In an interactive WB1.3 session, install the drivers onto the HDF with
+`Execute NIO:Install-FujiNet-WB13`; see upstream's [testing doc][doc].
 
 ---
 
@@ -56,14 +61,15 @@ fls
 
 | Path | What it is |
 | --- | --- |
-| `scripts/` | The four setup steps, in order |
-| `workspace/` | Clone of fujinet-nio-workspace (submodules included) |
-| `toolchain-src/` | Clone of bebbo's amiga-gcc (build tree) |
-| `assets/amigaOS3.1/` | Expanded AmigaOS tree — **licensed data, not committed** |
-| `config/config.env` | Template installed as `workspace/local/config.env` |
-| `patches/` | Portability patches applied to upstream sources |
-| `docs/` | Adaptation notes |
-| `logs/` | Build logs |
+| `scripts/` | The five steps, in order |
+| `config/config.env` | Toolchain and Amiberry paths → `workspace/local/config.env` |
+| `config/amiga.env` | Licensed-media path template → `workspace/local/amiga.env` |
+| `patches/` | Fixes applied to upstream; see [`patches/README.md`](patches/README.md) |
+| `docs/` | Upstream bug report(s) drafted from this work |
+| `workspace/` | Clone of fujinet-nio-workspace (not committed) |
+| `toolchain-src/` | Clone of bebbo's amiga-gcc build tree (not committed) |
+| `assets/amigaOS1.3/` | Generated WB1.3 HDF — **licensed data, not committed** |
+| `logs/` | Build and test logs |
 
 ---
 
@@ -75,208 +81,118 @@ brew install socat bash wget make lhasa gmp mpfr libmpc flex gettext \
              gnu-sed texinfo autoconf bison uv cmake ninja
 ```
 
-Amiberry must be **8.3.0 or newer** — earlier releases have the breakpoint and
-stepping bugs the debugger IPC section of the upstream doc calls out. The
-Homebrew cask build does include IPC socket support, including the debugger
-commands:
-
-```bash
-strings /Applications/Amiberry.app/Contents/MacOS/Amiberry | grep DEBUG_ACTIVATE
-```
+Amiberry must be **8.3.0 or newer** (debugger IPC fixes).
 
 ### Licensed assets you must supply
 
-Nothing here downloads AmigaOS. You need, from your own licensed media:
+Nothing here downloads AmigaOS. `03-configure-workspace.sh` reads them from
+`TOSEC_ROOT` (TOSEC Workbench folder) and `KICK_DIR` (ROM dumps):
 
-* A Kickstart 3.1 ROM (this setup uses **40.63 / A600**, the ECS ROM matching
-  the emulated 68000). 40.68 / A1200 is AGA-oriented.
-* The **Workbench 3.1 rev 40.42** six-disk ADF set.
-
-Point `scripts/02-build-amigaos-tree.sh` at them with `TOSEC_ROOT`, `WB_SET`
-and `KICKSTART_SRC` if your paths differ from the defaults.
-
----
-
-## Adaptations from the upstream document
-
-The upstream doc targets Linux and licensed AmigaOS 3.2. Everything below is a
-deviation, with the reason.
-
-### 1. AmigaOS 3.1 instead of 3.2
-
-Upstream's default `wb3.2` profile wants
-`ROM/kickCDTVa1000a500a2000a600.rom`, `ADF/Workbench3.2.adf` and
-`L/FastFileSystem` from a paid Hyperion AmigaOS 3.2 release.
-
-`scripts/02-build-amigaos-tree.sh` builds the same asset-root layout from an
-AmigaOS 3.1 disk set, mirroring what the 3.1 HD installer does: Workbench and
-Extras to the volume root, then `Storage/`, `Locale/`, `Fonts/`, plus
-`L/FastFileSystem` from the Install disk.
-
-3.1 turned out to carry everything the HDF builder reads: the Workbench disk
-has `Devs/serial.device`, and its `S/Startup-Sequence` has the `LoadWB` marker
-the builder splits on.
-
-A matching `wb3.1` profile is added to `configs/amiga/workbenches.yaml`.
-`wb3.2` is left untouched, so this repo still works for anyone who does own 3.2.
-
-**Known limitation:** `--with-driver` is not supported on 3.1. It prepends
-`C:LoadModule DEVS:fujinet-disk.device` to the startup sequence, and
-`LoadModule` is an AmigaOS 3.2 command. `scripts/04-run.sh` refuses the flag
-rather than producing an image that fails at boot.
-
-### 2. Toolchain at `$HOME/opt/amiga`
-
-The workspace defaults to `/opt/amiga`, which needs root on macOS. We install to
-`$HOME/opt/amiga` and set `AMIGA_TOOLCHAIN_BIN` — a documented workspace
-override — in `local/config.env`.
-
-### 3. Amiberry is an `.app`, not a PATH binary
-
-The cask installs `/Applications/Amiberry.app`, so there is no `amiberry` on
-`PATH`. `AMIBERRY_BIN` points at the bundle executable.
-
-### 4. SDL video driver
-
-The upstream doc mentions the runner defaulting `SDL_VIDEO_DRIVER` to
-`kmsdrm,wayland,x11`. The checked-out revision of `tools/amiga_emulator/run.py`
-sets no such default, and on macOS SDL selects `cocoa` on its own. No change
-needed.
+| System | Kickstart | Disks |
+| --- | --- | --- |
+| WB 1.3 | `kick34005.A500` — 1.3 r34.5, plain 256K dump (no `rom.key`) | Workbench 1.3.3 rev 34.34, disk 1 |
+| WB 3.1 | `kick40063.A600` — 3.1 r40.63, ECS/68000 | Workbench 3.1 rev 40.42, six-disk set |
 
 ---
 
-## Upstream bugs fixed along the way
+## The Workbench 1.3 system
 
-These are real portability defects, not local preferences. Patches are in
-`patches/`; they are worth sending upstream.
+Upstream's `wb13` environment copies a "clean, manually installed, bootable
+WB1.3 HDF" (`AMIGA_WB13_HDF`) but does not create one.
+`scripts/04-build-wb13-hdf.sh` builds it non-interactively, the way a 1.3 hard
+disk was set up by hand:
 
-### fujinet-nio (`patches/0001-fujinet-nio-macos-portability.patch`)
+1. Unpack the WB1.3 Workbench ADF **with xdftool's metadata sidecars**, so
+   protection bits (`s` on scripts, `p` on pure commands) and the boot block
+   survive. 1.3 only runs `S:` scripts that carry `s`.
+2. Drop the floppy-only `Addbuffers df0:` line from `S/Startup-Sequence`.
+3. Pack a 20 MB FFS hardfile.
 
-| File | Problem |
-| --- | --- |
-| `include/fujinet/io/devices/clock_commands.h` | uses `std::size_t` without `<cstddef>`; libstdc++ pulls it in transitively, libc++ does not |
-| `src/lib/tcp_channel.cpp` | calls `select()` without `<sys/select.h>` |
-| `src/platform/posix/wifi_link.cpp` | `#if defined(__linux__)` guards hide `<sys/socket.h>` etc., so `sockaddr` is undeclared on macOS even though the signature uses it |
+Kickstart 1.3 has no FastFileSystem in ROM, so Amiberry loads the WB1.3
+`L/FastFileSystem` from the host (`RDB: faked RDB filesystem 444F5301 (DOS\1)
+loaded` in its log). The runner finds it beside the env base HDF, which the
+`prebuilt_hdf` builder does not copy, so the script puts it there. For the
+interactive `wb13-a500` profile, `05-run.sh` points `AMIBERRY_FAST_FILE_SYSTEM`
+at the seeded copy.
 
-The third is guarded as `__linux__ || __APPLE__` rather than stubbed: Darwin has
-`getifaddrs`, `freeifaddrs` and `inet_ntop` with identical semantics, so the
-real implementation compiles and works.
+Persistent interactive images (`workspace/images/amigaos{1.3,3.1}-run.hdf`) are
+seeded once and never overwritten, so installs you make in them survive.
 
-After the patch the host build is clean and its own suite passes:
-`265 test cases | 5713 assertions | 0 failed`.
+---
+
+## Adaptations from upstream
+
+* **Toolchain at `$HOME/opt/amiga`** — upstream defaults to `/opt/amiga`,
+  which needs root on macOS; `AMIGA_TOOLCHAIN_BIN` is set in `local/config.env`.
+* **Amiberry is an `.app`** — `AMIBERRY_BIN` points into the bundle.
+* **Workbench 3.1 rather than 3.2** — 3.2 is a paid Hyperion product. Upstream
+  now ships a `wb31` six-disk environment, so this repo no longer builds its own
+  3.1 tree or profile.
 
 ### amiga-gcc (handled inside `scripts/01-install-toolchain.sh`)
 
 | Symptom | Cause and fix |
 | --- | --- |
 | `configure: error: Building GDB requires GMP 4.2+, and MPFR 3.1.0+` | The Makefile's Darwin branch passes only `--with-libgmp-prefix`; the bundled GDB configure wants `--with-gmp`/`--with-mpfr`, and Homebrew's `/opt/homebrew` is not on the default search path. We restate `CONFIG_BINUTILS` with both spellings. |
-| `_stdio.h:322:7: error: expected identifier or '('` | GCC 6.5's bundled zlib reads `TARGET_OS_MAC` as *classic* Mac OS and does `#define fdopen(fd,mode) NULL`, which mangles the real `fdopen` declaration. Fixed with `--with-system-zlib`. |
-| `fibonacci_heap.h:481: error: reference to non-static member function must be called` | GCC 6.5 typo: `heapb->min->compare (heapa->min)` should be `m_min` — the next line already says `heapa->m_min = heapb->m_min`. GCC defers the lookup in an uninstantiated template; clang does not. Patched in place. |
-| `libtool: No such file or directory` (Error 127), `No rule to make target 'math/.deps/acoshq.Plo'` | Parallel-make race in GCC's target libraries: compilation starts before configure writes `libtool`. The target-library phase is built with `-j1`. |
-| `SDL_systimer.c:85: error: conflicting types for 'TimerBase'` | `libSDL12` does not build and nothing here uses it. Dropped from the target list. |
+| `_stdio.h:322:7: error: expected identifier or '('` | GCC 6.5's bundled zlib reads `TARGET_OS_MAC` as *classic* Mac OS and does `#define fdopen(fd,mode) NULL`. Fixed with `--with-system-zlib`. |
+| `fibonacci_heap.h:481: error: reference to non-static member function must be called` | GCC 6.5 typo (`min` for `m_min`); clang does not defer the lookup. Patched in place. |
+| `libtool: No such file or directory` (Error 127) | Parallel-make race in GCC's target libraries; that phase is built with `-j1`. |
+| `SDL_systimer.c:85: error: conflicting types for 'TimerBase'` | `libSDL12` is unused here and dropped from the target list. |
 
-Note also that upstream's `all` target does **not** include `clib2`, which
-`nio-apps` requires (`-mcrt=clib2`). We add it explicitly.
-
-### fujinet-nio-workspace (`patches/0002-*`)
-
-`scripts/build-amiga-test-disk` needed four changes:
-
-| Symptom | Cause and fix |
-| --- | --- |
-| `FSError: File not found: WBStartup/Welcome` | The first-run Welcome program is an AmigaOS 3.2 addition. Deletion made tolerant via a `run_xdf_optional` helper. |
-| `FSError: Name already exists: serial.device` | The builder imports `Devs/serial.device` from the boot ADF, but an expanded 3.1 tree already ships it and xdftool will not overwrite a node. Delete before write. |
-| Volume boots labelled `AmigaOS3.2` | `xdftool pack` takes the volume name from the staging directory, which was hardcoded. Now derived from the OS tree's own name. |
-| **`C:C:Assign T: RAM:` in the generated Startup-Sequence** | The builder split the licensed Startup-Sequence at the *word* `LoadWB`. AmigaOS 3.1 writes `C:LoadWB`, so the leftover `C:` was glued onto the first injected command and that line failed at boot. Now splits at the start of the line. |
-
-That last one is **not macOS-specific** — it is a latent 3.1 incompatibility that
-would occur on Linux too.
-
-### fujinet-nio-driver (`patches/0003-*`)
-
-| Symptom | Cause and fix |
-| --- | --- |
-| `error: unknown type name 'BPTR'` | `disk.device/fujinet_disk_device.c` uses `BPTR` for its seglist without including `<dos/dos.h>`; NDK 3.2 does not pull it in transitively. Added the include, plus a matching stub header so the native (host) resident test still builds. |
-| ~24 × `format '%lu' expects 'long unsigned int', but argument has type 'ULONG {aka unsigned int}'` | NDK 3.2's `<exec/types.h>` switches `ULONG` from `unsigned long` to `uint32_t` whenever `__STDC_VERSION__ >= 199901`, and on this toolchain `uint32_t` is `unsigned int`. Both are 32-bit, so the arguments are cast to `unsigned long`/`long` at the call sites — correct under either NDK. |
-| `error: variable 'active' is uninitialized when passed as a const pointer argument` | clang 21's `-Wuninitialized-const-pointer` vs `-Werror`. The variables are address-as-token placeholders whose values are never read; initialising them changes nothing. |
-
-### nio-apps / nio-core-apps (`patches/0004-*`, `0005-*`)
-
-| Symptom | Cause and fix |
-| --- | --- |
-| `undefined reference to '_impure_ptr'` (doslistdiag), `'__locale_ctype_ptr'` (fboot) | `CFLAGS` omitted `-mcrt=clib2` while `LDFLAGS` had it. `-mcrt` selects the runtime's **headers** as well as its libraries, so objects compiled against newlib were linked against clib2. Added `-mcrt=clib2` to `CFLAGS`. **Also not macOS-specific.** |
-| `error: size of array 'uint32_is_ulong' is negative` | `sizetest` asserts `__builtin_types_compatible_p(uint32_t, unsigned long)`. On this toolchain `uint32_t` is `unsigned int` for both newlib and clib2. The three `_Static_assert`s that matter (everything is 32 bits) still pass, so the type-name check now reports at runtime instead of failing the build. |
+Upstream's `all` target does not include `clib2`, which the `wb31`/`wb32`
+profiles need; the script adds it.
 
 ---
 
-## Verification
+## Verification (2026-09-27)
 
-Both end-to-end paths from the upstream doc were run and pass.
+Host build: `fujinet-nio` **383 test cases, 0 failed**; all Amiga driver
+native contract suites pass; `tools/build` unit tests 23 passed.
 
-`wifitest` (`AMIGA_TEST_PROJECT=apps`), extracted from the guest HDF:
+| Env | Case | Result |
+| --- | --- | --- |
+| wb13 / a500-000 | `test_wb13_cold_stock_serial_worker` | **pass**, twice, in separate emulator processes |
+| wb13 / a500-000 | `test_wb13_ofs_mount_without_globvec` (`DN0:` OFS mount) | **pass** |
+| wb31 | `test_cli_arguments_and_persistent_state` | pass |
+| wb31 | `test_wifi_configuration_set_get_status_and_scan` | pass |
+| wb31 | `test_native_test_clock_exchange` | pass |
+| wb31 | `test_exchange_tool_installation_parity[serial,native]` | pass |
+| wb31 | `test_fmount_fumount_standard_adf[serial,native]` | fail — `FMOUNT HD RC=10`; fails identically without this repo's patches |
+| wb31 | `test_isolated_exchange` | fail — stalls in its TIMEOUT phase; without patch 0004 it fails earlier, with no FujiBus traffic at all |
+
+The WB1.3 cold-broker run, as the guest shows it:
 
 ```text
-FujiNet-NIO Wi-Fi API test
-link=0 enabled=0 RSSI=0
-IP= gateway= DNS=
-BSSID=(none)
-SSID= BSSID= password=not set
-scan count=1 more=1
-  FujiNet-Sim channel=1 RSSI=-42 BSSID=02:00:00:00:00:01
-Wi-Fi API test passed
+Resident loaded: fujinet-nio.device
+installed_backend=serial lifecycle=cold
+req_len=6 resp_len=19 elapsed_us=80002 ttfb_us=- result=0 cause=0 native=0 status=0 backend=cold
 ```
 
-with matching FujiBus frames on the host side (device `0xF3`, the Wi-Fi device):
+with the host answering the clock request (device `0x45`) and the
+completion-marker file listing (device `0xFE`).
 
-```text
-fujibus: receive: id=3 dev=0xF3 cmd=0x04 params=0 payload=4
-fujibus: send: dev=0xF3 status=0 cmd=0x04 payload=24
-  0000: 01 01 01 0b 46 75 6a 69 4e 65 74 2d 53 69 6d 02  |....FujiNet-Sim.|
-```
-
-`fhost` (`AMIGA_TEST_PROJECT=core`) returns `HOST: (none) / PATH: (none)` for an
-unconfigured host, talking to device `0xF0` (HostService).
-
-Reproduce either with:
-
-```bash
-cd workspace && ./scripts/build.sh amiga-e2e -- --timeout 90
-```
-
-```bash
-cd workspace && AMIGA_TEST_PROJECT=core AMIGA_TEST_APP=fhost \
-  ./scripts/build.sh amiga-e2e -- --timeout 90
-```
-
-Read a result out of the image with:
-
-```bash
-uvx --from amitools xdftool workspace/build/images/amiga-wifitest.hdf type wifitest.result
-```
-
-**Gotcha:** run those in a shell that has *not* already sourced
-`scripts/env.sh`. `env.sh` sets `AMIGA_TEST_COMMAND` from `AMIGA_TEST_APP` with
-`:-`, so a previously exported value sticks and you will silently run the old
-app. Use `env -u AMIGA_TEST_COMMAND -u AMIGA_TEST_APP ...` if in doubt.
+Every E2E run leaves logs, the test HDF and per-second screenshots under
+`workspace/test-evidence/amiberry-<timestamp>/<case>/`.
 
 ---
 
 ## Troubleshooting
 
-**`xdftool unpack` nests output under a volume-name directory.** It extracts
-directly into the destination only when that directory does not already exist;
-otherwise it creates `<VolumeName>/` plus `.blkdev`/`.bootcode`/`.xdfmeta`
-sidecars. `scripts/02-build-amigaos-tree.sh` removes the destination first.
+**`scripts/amiga-tests` exits 1 with no output.** `source scripts/env.sh`
+failed; patch 0002 fixes the cause. Check with
+`bash -c 'set -e; source workspace/scripts/env.sh; echo ok'`.
 
-**Rebuilding just the toolchain step that failed.** The amiga-gcc build is
-incremental. Delete the relevant stamp under
-`toolchain-src/build-Darwin-m68k-amigaos/` and re-run
-`scripts/01-install-toolchain.sh`.
+**Every E2E case is `SKIPPED ... prerequisites unavailable: amiberry`.**
+Patch 0002 not applied, or `AMIBERRY_BIN` not set in `local/config.env`.
 
-**Checking the Amiberry IPC socket.** The runner prints the path and writes it
-to `workspace/build/amiga-e2e/amiberry.sock.path`:
+**Guest shows "Software error - task held".** Read the fault from
+`amiberry.log` (`Exception 3 (...) at <pc>`), then while a run is live:
+`AMIBERRY_IPC_SOCKET=/tmp/amiberry.sock workspace/scripts/amiberry-ipc
+DISASSEMBLE 0x<pc - 0x20> 16`. Match the bytes against
+`m68k-amigaos-objdump -d` of the candidate binary to find the owner.
 
-```bash
-workspace/scripts/amiberry-ipc GET_STATUS
-workspace/scripts/amiberry-ipc SCREENSHOT /tmp/screen.png
-```
+**A silently stale app runs.** Use `env -u AMIGA_TEST_COMMAND -u AMIGA_TEST_APP`
+in a shell that has already sourced `scripts/env.sh`; it sets these with `:-`.
+
+**Rebuilding just the toolchain step that failed.** Delete the relevant stamp
+under `toolchain-src/build-Darwin-m68k-amigaos/` and re-run step 01.

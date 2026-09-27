@@ -1,28 +1,53 @@
 # Patches
 
-Portability fixes applied to upstream sources to build and run this stack on
-macOS (Apple Silicon) with an AmigaOS 3.1 asset tree and the NDK 3.2 that ships
-with bebbo's amiga-gcc. Apply with `git apply` inside the matching repo.
+Fixes applied to upstream sources to build and run this stack on macOS
+(Apple Silicon), including Workbench 1.3 on a 68000 A500. Applied
+automatically by `scripts/02-clone-workspace.sh`; each also applies by hand
+with `git apply` inside the listed repo.
 
 | Patch | Repo | What it fixes |
 | --- | --- | --- |
-| `0001` | `fujinet-nio` | Missing `<cstddef>` / `<sys/select.h>` includes and Linux-only `#if` guards that hide `sockaddr` on macOS |
-| `0002` | `fujinet-nio-workspace` | AmigaOS 3.1 support in `build-amiga-test-disk` (optional `WBStartup/Welcome`, overwrite `Devs/serial.device`, volume name from the OS tree, line-based `LoadWB` split) plus the `wb3.1` profile |
-| `0003` | `fujinet-nio-driver` | `<dos/dos.h>` for `BPTR`, a matching stub header for the native tests, `%lu`/`%ld` argument casts for NDK 3.2's `uint32_t`-based `ULONG`, and an initialised token variable for clang's `-Wuninitialized-const-pointer` |
-| `0004` | `nio-apps` | `-mcrt=clib2` in `CFLAGS` so headers match the linked runtime; `sizetest` reports rather than asserts `uint32_t == unsigned long` |
-| `0005` | `nio-core-apps` | `-mcrt=clib2` in `CFLAGS` (same runtime mismatch) |
+| `0001` | `fujinet-nio` | `tests/directory_packet_io.cpp` calls Linux-only `getrandom()`; use `getentropy()`, which glibc and macOS both declare in `<sys/random.h>` |
+| `0002` | `fujinet-nio-workspace` | Three harness bugs, below |
+| `0003` | `fujinet-nio-driver` | Native test uses `mkdtemp()` under strict `_POSIX_C_SOURCE`; macOS hides it without `_DARWIN_C_SOURCE` (the file already sets glibc's `_DEFAULT_SOURCE`) |
+| `0004` | `fujinet-nio-driver` | **`fujinet-nio.device` crashes Kickstart 1.3 on a 68000** — see below |
 
-## The two that are not macOS-specific
+## 0004: the Kickstart 1.3 crash (not macOS-specific)
 
-`0002`'s `LoadWB` change and `0004`/`0005`'s `-mcrt=clib2` are latent bugs that
-would bite on Linux too:
+Symptom: on WB1.3 / KS 34.5 / 68000, `fujinet-load-resident
+DEVS:fujinet-nio.device` → *Software error - task held*; Amiberry logs
+`Exception 3` (address error) inside the device.
 
-* `build-amiga-test-disk` split the Startup-Sequence at the *word* `LoadWB`.
-  AmigaOS 3.1 writes `C:LoadWB`, so the leftover `C:` was glued onto the first
-  injected command, yielding `C:C:Assign T: RAM:`, which fails at boot. The
-  patch splits at the start of that line instead.
-* `CFLAGS` omitted `-mcrt=clib2` while `LDFLAGS` had it. `-mcrt` selects the
-  runtime's *headers* as well as its libraries, so objects were compiled
-  against newlib and linked against clib2. It only surfaces when a translation
-  unit touches a newlib-specific inline, e.g. `_impure_ptr` (doslistdiag) or
-  `__locale_ctype_ptr` (fboot).
+`nio.device` declares `struct DosLibrary *DOSBase;` — a tentative
+definition. bebbo's toolchain libc also defines `DOSBase` (in
+`__dosbase.o`) as a libnix auto-open entry initialised to `-1`, which program
+startup code replaces with a real `dos.library` base. The linker merged the
+two, so the device got the `-1`. It links with `-nostartfiles`, so nothing ever
+replaced it. `open_backend()`'s `if (DOSBase == NULL) OpenLibrary(...)` was
+therefore skipped and `DOSBase->dl_lib.lib_Version` was read through
+`0xFFFFFFFF + 0x14` — an odd address, which a 68000 faults on.
+
+Verified in the running guest: the instruction before the fault is
+`MOVEA.L DOSBase,A6` and the global held `$FFFFFFFF`. With `DOSBase = NULL`
+the link no longer pulls in `__dosbase.o`, the value is a real `.bss` zero, and
+the device opens `dos.library` itself.
+
+The same `-1` also broke WB3.1: `test_isolated_exchange` reached FujiNet with
+zero frames before the fix; after it, the broker's EXCHANGE, REUSE, RESIDENT
+and AFTER_OPENCNT0 phases pass (its later TIMEOUT phase still stalls — an
+upstream issue that was hidden until now).
+
+## 0002: workspace harness
+
+| File | Problem |
+| --- | --- |
+| `scripts/env.sh` | `pathadd_end` returned 1 for a missing dir. It is the last command in `setup_nio_environment` (for `/opt/watcom/binl`), so `source scripts/env.sh` failed and every `set -e` caller — e.g. `scripts/amiga-tests` — exited silently with status 1 on any machine without Open Watcom |
+| `integration-tests/amiberry/conftest.py` | Prerequisite check required `amiberry` on `PATH`, skipping every E2E case although the runner itself launches `AMIBERRY_BIN` (a path inside the macOS `.app`) |
+| `tools/build/nio_build/amiga_config.py` | Profiles pass `rom_key: ${AMIGA_WB13_ROM_KEY}`; with a plain (non-Amiga Forever) ROM that variable is unset, the literal `${...}` became a path, and `wb13-a500` refused to launch. An unset or empty optional key now means "no key", as the docs describe |
+
+## Retired
+
+The previous `0001`–`0005` (fujinet-nio includes, AmigaOS 3.1 test-disk
+builder, NDK 3.2/clang driver fixes, `-mcrt=clib2` in the app makefiles) were
+merged upstream or superseded by upstream's `scripts/amiga-env`. They are in
+this repo's git history.

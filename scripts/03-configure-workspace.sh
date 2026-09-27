@@ -1,65 +1,51 @@
 #!/usr/bin/env bash
-# Apply this Mac's configuration to the cloned fujinet-nio-workspace:
-#   - local/config.env       (toolchain, Amiberry binary, AmigaOS 3.1 assets)
-#   - a wb3.1 profile in configs/amiga/workbenches.yaml
+# Configure the cloned workspace for this Mac and build the WB3.1 environment:
+#   - local/config.env  (toolchain, Amiberry binary)
+#   - local/amiga.env   (licensed media paths; see config/amiga.env)
+#   - build/amiga-envs/wb31/base.hdf via upstream's six-disk builder
+#   - images/amigaos3.1-run.hdf for the interactive wb31-a1200 profile
 #
-# Safe to re-run; both edits are idempotent.
+# Upstream's scripts/amiga-env now assembles the 3.1 HDF from the six ADFs
+# itself, replacing this repo's former expanded-tree step and wb3.1 profile.
+#
+# Media locations (override as needed):
+#   TOSEC_ROOT  TOSEC "Operating Systems - Workbench" folder
+#   KICK_DIR    directory with kick40063.A600 and kick34005.A500
 set -euo pipefail
 
 PROJ="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="${WS:-$PROJ/workspace}"
+TOSEC_ROOT="${TOSEC_ROOT:-$HOME/Downloads/_older_2026/Commodore Amiga - Operating Systems - Workbench (TOSEC-v2014-02-03)}"
+KICK_DIR="${KICK_DIR:-$HOME/Downloads/_older_2026/RetroArch/.retroarch/system}"
 
-[ -d "$WS" ] || { echo "workspace not found: $WS" >&2; exit 1; }
+[ -d "$WS" ] || { echo "workspace not found: $WS (run 02-clone-workspace.sh)" >&2; exit 1; }
 
-# --- local/config.env ------------------------------------------------------
 mkdir -p "$WS/local"
-sed "s|__PROJ__|$PROJ|g" "$PROJ/config/config.env" > "$WS/local/config.env"
+cp "$PROJ/config/config.env" "$WS/local/config.env"
 echo "==> wrote $WS/local/config.env"
 
-# --- wb3.1 profile ---------------------------------------------------------
-# Mirrors the upstream wb3.2 profile (build_test_disk, 68000, 512K chip,
-# 8MB fast) but names the 3.1 Kickstart this asset root actually ships.
-PROFILES="$WS/configs/amiga/workbenches.yaml"
-if grep -q "^  wb3.1:" "$PROFILES"; then
-  echo "==> wb3.1 profile already present in $PROFILES"
-else
-  python3 - "$PROFILES" <<'PY'
-import sys
-from pathlib import Path
+# '|' is safe as the sed delimiter: none of these paths contain it.
+sed -e "s|__TOSEC__|$TOSEC_ROOT|g" -e "s|__KICK__|$KICK_DIR|g" -e "s|__PROJ__|$PROJ|g" \
+  "$PROJ/config/amiga.env" > "$WS/local/amiga.env"
+echo "==> wrote $WS/local/amiga.env"
 
-path = Path(sys.argv[1])
-text = path.read_text()
+echo "==> checking media"
+missing=0
+while IFS= read -r path; do
+  case "$path" in *wb13-clean.hdf) continue ;; esac  # built by step 04
+  if [ -f "$path" ]; then echo "    ok   ${path##*/}"
+  else echo "    MISS $path"; missing=1; fi
+done < <(grep -v '^[[:space:]]*#' "$WS/local/amiga.env" | grep -o '"[^"]*"' | tr -d '"')
+[ "$missing" -eq 0 ] || { echo "fix TOSEC_ROOT / KICK_DIR and re-run" >&2; exit 1; }
 
-block = """  wb3.1:
-    build_test_disk: true
-    kickstart: ${AMIBERRY_ASSET_ROOT}/ROM/kick31.rom
-    settings:
-      cpu_type: 68000
-      chipmem_size: 512
-      fastmem_size: 8
-      cpu_compatible: true
-      cachesize: 0
-
-"""
-
-# Insert directly after the "profiles:" header so it sits beside wb3.2.
-marker = "profiles:\n"
-at = text.index(marker) + len(marker)
-path.write_text(text[:at] + "\n" + block + text[at:].lstrip("\n"))
-print("inserted wb3.1 profile")
-PY
-  echo "==> patched $PROFILES"
-fi
-
-echo
-echo "==> verifying"
 cd "$WS"
-# shellcheck source=/dev/null
-source scripts/env.sh
-echo "    AMIGA_TOOLCHAIN_BIN = $AMIGA_TOOLCHAIN_BIN"
-echo "    AMIBERRY_BIN        = $AMIBERRY_BIN"
-echo "    AMIBERRY_ASSET_ROOT = $AMIBERRY_ASSET_ROOT"
-echo "    AMIBERRY_KICKSTART  = $AMIBERRY_KICKSTART"
-for f in "$AMIBERRY_BIN" "$AMIBERRY_KICKSTART" "$AMIBERRY_WORKBENCH_ADF" "$AMIBERRY_FAST_FILE_SYSTEM"; do
-  [ -e "$f" ] && echo "    ok   $f" || echo "    MISS $f"
-done
+scripts/amiga-env build wb31
+
+# The interactive profile boots a persistent, user-owned image.  Seed it once
+# from the pristine base; never overwrite an existing one.
+RUN_HDF="$WS/images/amigaos3.1-run.hdf"
+if [ ! -e "$RUN_HDF" ]; then
+  mkdir -p "$(dirname "$RUN_HDF")"
+  cp build/amiga-envs/wb31/base.hdf "$RUN_HDF"
+  echo "==> seeded interactive image $RUN_HDF"
+fi

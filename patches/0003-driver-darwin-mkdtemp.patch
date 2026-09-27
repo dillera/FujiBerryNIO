@@ -1,0 +1,11 @@
+diff --git a/amiga/tests/test_fujinet_nio_directory_backend.c b/amiga/tests/test_fujinet_nio_directory_backend.c
+index 72ecab0..e1eb102 100644
+--- a/amiga/tests/test_fujinet_nio_directory_backend.c
++++ b/amiga/tests/test_fujinet_nio_directory_backend.c
+@@ -1,5 +1,6 @@
+ #define _POSIX_C_SOURCE 200809L
+ #define _DEFAULT_SOURCE
++#define _DARWIN_C_SOURCE
+ 
+ #include <errno.h>
+ #include <stdio.h>

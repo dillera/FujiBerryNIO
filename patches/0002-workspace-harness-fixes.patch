@@ -1,0 +1,49 @@
+diff --git a/integration-tests/amiberry/conftest.py b/integration-tests/amiberry/conftest.py
+index 6405080..c13dc70 100644
+--- a/integration-tests/amiberry/conftest.py
++++ b/integration-tests/amiberry/conftest.py
+@@ -612,7 +612,9 @@ def amiga_environment(pytestconfig: Any) -> dict[str, str]:
+             "Build first with: scripts/amiga-env build <id> [--machine <machine_id>]"
+         )
+ 
+-    for command in ("amiberry", "socat"):
++    # Check the binary the runner will actually launch: AMIBERRY_BIN may be an
++    # absolute path (e.g. inside a macOS .app bundle) rather than a PATH entry.
++    for command in (environment.get("AMIBERRY_BIN") or "amiberry", "socat"):
+         if shutil.which(command, path=environment.get("PATH")) is None:
+             missing.append(command)
+     if not shutil.which("xdftool", path=environment.get("PATH")) and not shutil.which("uvx", path=environment.get("PATH")):
+diff --git a/scripts/env.sh b/scripts/env.sh
+index 59f583a..96ca883 100755
+--- a/scripts/env.sh
++++ b/scripts/env.sh
+@@ -4,7 +4,9 @@
+ CD=cd
+ 
+ pathadd_end() {
+-  [ -d "$1" ] || return 1
++  # A missing optional toolchain dir is not an error: this is often the last
++  # command in setup_nio_environment, whose status `source env.sh` returns.
++  [ -d "$1" ] || return 0
+   [[ ":$PATH:" == *":$1:"* ]] || export PATH="$PATH:$1"
+ }
+ 
+diff --git a/tools/build/nio_build/amiga_config.py b/tools/build/nio_build/amiga_config.py
+index e730453..3403a08 100644
+--- a/tools/build/nio_build/amiga_config.py
++++ b/tools/build/nio_build/amiga_config.py
+@@ -339,6 +339,14 @@ def load_profile(path: Path, name: str, root: Path, environment: dict[str, str]
+         )
+     if config_keys:
+         result["uae_config"] = result.pop(config_keys[0])
++    # rom_key is optional: a plain (non-Amiga Forever) ROM needs none, so a
++    # reference to an unset or empty variable means "no key", not a path.
++    rom_key = result.get("rom_key")
++    if isinstance(rom_key, str):
++        substituted = string.Template(rom_key).safe_substitute(
++            {**os.environ, **environment}).strip()
++        if not substituted or "$" in substituted:
++            del result["rom_key"]
+     for key in ("disk", "harddrive", "kickstart", "rom_key",
+                 "fast_file_system", "uae_config"):
+         if key in result:

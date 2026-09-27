@@ -1,0 +1,15 @@
+diff --git a/tests/directory_packet_io.cpp b/tests/directory_packet_io.cpp
+index 24ca41d..e37286b 100644
+--- a/tests/directory_packet_io.cpp
++++ b/tests/directory_packet_io.cpp
+@@ -102,7 +102,9 @@ bool publish_control(const std::string& path, const std::string& value)
+ std::string fresh_challenge()
+ {
+     unsigned char random[16];
+-    if (::getrandom(random, sizeof(random), 0) != sizeof(random)) return {};
++    // getentropy() rather than getrandom(): the latter is Linux-only, while
++    // both glibc and macOS provide getentropy() in <sys/random.h>.
++    if (::getentropy(random, sizeof(random)) != 0) return {};
+     static const char hex[] = "0123456789abcdef";
+     std::string value;
+     for (const auto byte : random) {
