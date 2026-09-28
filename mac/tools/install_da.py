@@ -7,8 +7,8 @@ Usage: install_da.py <System.bin> <flatcode.flt> <output.bin>
                      [--name "FujiNet CONFIG"] [--id 21] [--drop OtherDA]...
 
 Takes a Retro68 flat code resource (single entry point at offset 0),
-prepends the classic 30-byte DRVR header (all five routine offsets
-pointing at the code start), and adds it to the System file's resource
+prepends the DRVR header and five stubs (one per routine: routine number
+in D0, then a branch to the code), and adds it to the System file's resource
 fork as DRVR <id> with name "\\0<name>" and attributes 0x20 (purgeable)
 -- exactly the convention used by the System 6 built-in DAs.
 """
@@ -145,15 +145,26 @@ def build_fork(map_attrs, resources):
 
 
 def build_drvr(flat, name):
+    # Header, name, then one stub per routine: moveq #routine,d0 then
+    # bra.w to the flat code. The DA's glue dispatches on D0, because the
+    # Device Manager leaves ioTrap unset for Open and Close.
     hdr = struct.pack(">HHHH", DRVR_FLAGS, 0, DRVR_EMASK, 0)
     namebytes = bytes([len(name)]) + name.encode("macroman")
     hdrlen = 8 + 10 + len(namebytes)
     if hdrlen % 2:
         namebytes += b"\0"
         hdrlen += 1
-    entry = hdrlen
-    hdr += struct.pack(">HHHHH", entry, entry, entry, entry, entry)
-    return hdr + namebytes + flat
+    routines = [0, 2, 4, 5, 1]           # open, prime, control, status, close
+    code_at = hdrlen + 6 * len(routines)
+    stubs = b""
+    offsets = []
+    for i, r in enumerate(routines):
+        at = hdrlen + 6 * i
+        offsets.append(at)
+        disp = code_at - (at + 2 + 2)    # bra.w: relative to its extension word
+        stubs += struct.pack(">HHh", 0x7000 | r, 0x6000, disp)
+    hdr += struct.pack(">HHHHH", *offsets)
+    return hdr + namebytes + stubs + flat
 
 
 def main():

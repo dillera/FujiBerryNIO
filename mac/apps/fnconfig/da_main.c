@@ -3,14 +3,15 @@
  * Desk Accessory (DRVR) wrapper around the CONFIG core.
  *
  * Built as a Retro68 flat code resource (-Wl,--mac-flat) with entry
- * point DRVRENTRY. tools/install_da.py prepends the 30-byte DRVR
- * header (all five routine offsets point at DRVRENTRY) and injects
- * the result into the System file as DRVR 21 "\0FujiConfig".
+ * point DRVRENTRY. tools/install_da.py prepends the DRVR header and
+ * five stubs, one per routine, that load the routine number into D0
+ * and branch to the code, and adds the result to the System file as
+ * DRVR 21 "\0FujiNet CONFIG".
  *
  * The Device Manager calls the driver with A0 = ParamBlock, A1 = DCE,
  * result in D0. Open/Close return with RTS; Prime/Control/Status must
- * exit through JIODone ($08FC). The glue below dispatches on the low
- * three bits of ioTrap so a single entry point serves all five slots.
+ * exit through JIODone ($08FC) unless called immediate. The glue below
+ * dispatches on the routine number in D0.
  */
 
 #include <Quickdraw.h>
@@ -26,12 +27,15 @@ asm(
     ".text\n"
     ".globl DRVRENTRY\n"
     "DRVRENTRY:\n"
+    /* D0 = the routine, set by the stub its DRVR header offset points at
+       (tools/install_da.py). ioTrap cannot tell: the Device Manager does
+       not set it for Open and Close. */
     "   move.l  %d2,-(%sp)\n"     /* preserve caller d2 */
     "   move.l  %a1,-(%sp)\n"     /* keep the DCE for the JIODone exit */
-    "   move.w  6(%a0),%d2\n"     /* ioTrap, kept across the C call */
-    "   move.w  %d2,%d0\n"
-    "   and.w   #7,%d0\n"         /* selector: 0=open 1=close 2/3=prime */
-    "   move.w  %d0,-(%sp)\n"     /*           4=control 5=status 6=killIO */
+    "   move.w  6(%a0),%d2\n"     /* ioTrap (Prime/Control/Status only), */
+    "   swap    %d2\n"            /* high word; the routine, low word,   */
+    "   move.w  %d0,%d2\n"        /* kept across the C call              */
+    "   move.w  %d0,-(%sp)\n"     /* 0=open 1=close 2=prime 4=control 5=status */
     "   move.l  %a1,-(%sp)\n"
     "   move.l  %a0,-(%sp)\n"
     /* PC-relative: nothing is relocated yet at this point, an absolute
@@ -39,9 +43,9 @@ asm(
     "   bsr.w   DADispatch\n"
     "   lea     10(%sp),%sp\n"
     "   move.l  (%sp)+,%a1\n"     /* A1 = DCE again */
-    "   move.w  %d2,%d1\n"
-    "   andi.w  #6,%d1\n"
-    "   beq     1f\n"             /* Open/Close: plain RTS */
+    "   cmp.w   #2,%d2\n"
+    "   blo     1f\n"             /* Open/Close: plain RTS */
+    "   swap    %d2\n"
     "   btst    #9,%d2\n"         /* noQueueBit: immediate call? */
     "   bne     1f\n"             /* immediate: plain RTS */
     "   move.l  (%sp)+,%d2\n"
