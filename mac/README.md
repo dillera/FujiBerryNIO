@@ -1,8 +1,13 @@
 # FujiNet NIO on the classic Macintosh (floppy port)
 
-fujinet-nio serving a 68000 Mac through its **floppy port**: HD20 (DCD) disks,
-and **FujiBus commands from Mac programs carried over the IWM**. The
-classic FujiNet Mac firmware has the first; nothing had the second.
+fujinet-nio serving a 68000 Mac through its **floppy port**, as the FujiNet
+Mac firmware does:
+
+* HD20 (DCD) disks;
+* the 800K GCR floppy.
+
+It adds something no firmware had: **FujiBus commands from Mac programs,
+carried over the IWM**.
 
 Verified in the Snow emulator, as a Mac Plus (ROM v3) running System 6.0.8:
 
@@ -13,8 +18,19 @@ Verified in the Snow emulator, as a Mac Plus (ROM v3) running System 6.0.8:
 * **FujiNetProbe**, a Mac app built on fujinet-nio-lib, finds the FujiNet and
   reads its clock. It then has the FujiNet make an HTTP GET (live weather,
   371 bytes). Every call is a FujiBus packet through the floppy port.
+* The probe then **mounts a floppy image** into NIO's floppy slot, again
+  over the floppy port. NIO GCR-encodes it with the FujiNet Mac firmware's
+  encoder, and **"NIO Floppy" appears in the external drive**.
+* The Finder duplicates an application on that floppy. Its writes go back as
+  GCR tracks, and NIO decodes them into the `.dsk` (116 sectors). The copy's
+  resource data is identical: only the name the Finder stamps into the fork
+  header differs.
+* A Mac eject tells NIO, which unmounts the slot and forgets it, as the
+  firmware does.
 
 ![FujiNetProbe on a Mac Plus](evidence/probe-clock-http.png)
+
+![NIO Floppy in the external drive](evidence/nio-floppy-on-desktop.png)
 
 ## How it fits together
 
@@ -27,8 +43,30 @@ Snow  core/src/mac/swim/dcd.rs                  plays the Pico's part
    v   ('A'..'D' select, 'R' read, 'W' write, 'T' status, 'h' units)
 fujinet-nio  MacFloppyFramer                    (patch 0006)
    |-- HD20 blocks  -> DiskService (slot n = DCD unit n)
+   |-- floppy       -> DiskService slot 5 (wire numbering), GCR codec
    `-- mailbox blocks -> FujiBus -> clock, network, disk, ... devices
 ```
+
+### The floppy
+
+NIO speaks the board's floppy commands:
+
+* **From the drive side:** `0`/`4` step direction, `1` step (answered with the
+  track), `2`/`6` motor on/off (`M`/`F`), `7` eject (`E`).
+* **From NIO:** `s`/`d` inserted, `u`/`l` writable/locked, `r` removed.
+
+`mac_gcr.{h,cpp}` is the FujiNet Mac firmware's encoder and decoder,
+unchanged. On the board the ESP32 streams tracks from its RMT peripheral and
+receives captured WR bitstreams. An emulator has neither wire, so it uses two
+extra commands:
+
+* `#` cyl side returns one encoded track.
+* `P` cyl side bits sends back a whole written track. NIO finds every
+  sector's address and data fields in it, including one written across the
+  index, and writes only the sectors that changed.
+
+Snow asks for all 160 tracks when a disk is inserted, and on motor-off sends
+back only the tracks the Mac changed.
 
 The drive side of the link is exactly what the Pico on the FujiNet Mac board
 already speaks to the ESP32 (`fujinet-firmware lib/bus/mac/mac.h`). So the
@@ -66,12 +104,12 @@ the volume needs neither.
 | --- | --- |
 | `patches/0006-fujinet-nio-mac-floppy-bus.patch` | NIO: `MacFloppyFramer`, profile `Mac68k`/`MacFloppy`, preset `mac-floppy-tcp-debug`, `.hda/.hfv/.dsk` as 512-byte-block images |
 | `patches/0007-fujinet-nio-lib-mac68k.patch` | fujinet-nio-lib: `mac68k` target (Retro68), `src/platform/mac68k/fn_transport.c` |
-| `mac/snow/0001-snow-fujinet-dcd-chain.patch` | Snow: the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner. Also committed on branch `fujinet-dcd` of `~/code/snow` |
-| `mac/apps/fnprobe` | FujiNetProbe: clock + HTTP GET through fujinet-nio-lib, a 54 KB Toolbox app |
+| `mac/snow/*.patch` | Snow, also committed on branch `fujinet-dcd` of `~/code/snow`: (1) the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner; (2) the FujiNet floppy in the external drive |
+| `mac/apps/fnprobe` | FujiNetProbe: clock, HTTP GET and a floppy mount through fujinet-nio-lib; a 56 KB Toolbox app |
 | `mac/tools/run-nio.sh` | Run NIO's Mac bus on `127.0.0.1:65510` (config in `run/fujinet-data/fujinet.yaml`) |
 | `mac/tools/run-snow.sh` | Snow GUI as a Mac Plus with the DCD chain (`SNOW_FUJINET_DCD`) |
-| `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume with the apps (NIO stopped) |
-| `mac/tools/pico_sim.py` | Plays the Pico against NIO: units, status, HFS blocks, a FujiBus clock call through the mailbox |
+| `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume and the `NIO Floppy` 800K image, with the apps (NIO stopped) |
+| `mac/tools/pico_sim.py` | Plays the Pico against NIO: units, status, HFS blocks, a FujiBus clock call through the mailbox, and a floppy mounted over FujiBus, one of its tracks round-tripped, then ejected |
 | `mac/tools/e2e.sh` | The whole thing headless, with screenshots |
 | `mac/evidence/` | Screenshots from the verified runs |
 
@@ -101,7 +139,7 @@ tools/run-snow.sh          # interactive; or tools/e2e.sh headless
 ```
 
 In Snow the FujiNet disk appears under the boot floppy. Open it and run
-**FujiNetProbe**.
+**FujiNetProbe**. When you quit it, the NIO Floppy is in the external drive.
 
 `run/fujinet-data/fujinet.yaml` mounts `host:/mac/FujiNet.hda` read/write as
 unit 0 (the boot config mount). Stop NIO before changing an image on the
@@ -112,10 +150,12 @@ a stale catalog back.
 
 * **HD20 size.** Keep images at or below 65,519 blocks (32 MB less the
   mailbox). The Mac rejects HD20s over 65,535 blocks.
-* **Floppy (MCI).** Not yet served by NIO. In Snow the Mac's own floppy
-  drives work as usual. On the real board the floppy is streamed as GCR from
-  the ESP32's RMT peripheral, which NIO does not have. The framer ignores the
-  board's floppy command bytes, so the link stays in step.
+* **Floppy images.** 400K and 800K sector images (`.dsk`). DiskCopy 4.2 and
+  MOOF are not handled yet. On real hardware NIO would still need the ESP32
+  RMT streaming and the WR capture frames (`'w'`); the protocol side is in
+  place.
+* **The FujiNet's floppy goes in the external drive.** On a Mac Plus in Snow
+  the boot floppy stays in the internal drive.
 * **Flushing.** The Mac caches the catalog until unmount or Shut Down.
   Killing the emulator loses the Finder's last changes, as on real hardware.
 * **Snow warnings.** `IWM unknown read q6 = true q7 = true` during HD20
@@ -125,9 +165,8 @@ a stale catalog back.
 
 ## Next
 
-* Floppy images served by NIO: port the GCR encoder (`fujinet-firmware
-  lib/media/mac/macGCR.cpp`), and add a track-data message to the board
-  protocol for emulators.
-* NIO on the FujiNet Mac board's ESP32 with the Pico UART as the channel.
+* NIO on the FujiNet Mac board's ESP32 with the Pico UART as the channel,
+  plus RMT track streaming and `'w'` write-capture frames.
+* DiskCopy 4.2 and MOOF floppies.
 * Mac-side CONFIG over the mailbox: host and slot browsing, mounting (the
   `fn_disk_*` and slot-catalog calls already work through it).

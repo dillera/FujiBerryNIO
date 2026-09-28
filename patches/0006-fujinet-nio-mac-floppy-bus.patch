@@ -1,5 +1,5 @@
 diff --git a/CMakeLists_posix.cmake b/CMakeLists_posix.cmake
-index 1f426c0..67e5cb5 100644
+index 1f426c0..8763341 100644
 --- a/CMakeLists_posix.cmake
 +++ b/CMakeLists_posix.cmake
 @@ -44,6 +44,7 @@ option (FN_BUILD_ATARI_FUJIBUS_NETSIO "Build for Atari NIO FujiBus over NetSIO/U
@@ -18,15 +18,16 @@ index 1f426c0..67e5cb5 100644
          # ADD MORE BUILD OPTIONS AS WE DEVELOP THEM HERE
  )
  
-@@ -189,6 +191,7 @@ set(FUJINET_NIO_SOURCES
+@@ -189,6 +191,8 @@ set(FUJINET_NIO_SOURCES
          src/lib/tnfs/tnfs_tcp_client.cpp
          src/lib/tnfs/tnfs_udp_client.cpp
          src/lib/transport/atari_sio_fujibus_framer.cpp
 +        src/lib/transport/mac_floppy_framer.cpp
++        src/lib/disk/mac_gcr.cpp
          src/lib/transport/legacy/byte_based_legacy_transport.cpp
          src/lib/transport/legacy/iwm_traits.cpp
          src/lib/transport/legacy/iwm_transport.cpp
-@@ -245,6 +248,8 @@ elseif(FN_BUILD_FUJIBUS_TCP)
+@@ -245,6 +249,8 @@ elseif(FN_BUILD_FUJIBUS_TCP)
      list(APPEND FUJINET_NIO_SOURCES src/lib/build_profile/fujibus_tcp.cpp)
  elseif(FN_BUILD_AMIGA_RS232)
      list(APPEND FUJINET_NIO_SOURCES src/lib/build_profile/amiga_rs232.cpp)
@@ -96,12 +97,160 @@ index b645df3..9ff7a4b 100644
      // ...
  };
  
+diff --git a/include/fujinet/disk/mac_gcr.h b/include/fujinet/disk/mac_gcr.h
+new file mode 100644
+index 0000000..2287a49
+--- /dev/null
++++ b/include/fujinet/disk/mac_gcr.h
+@@ -0,0 +1,128 @@
++#pragma once
++
++/**
++ * Macintosh 400K/800K GCR ("Sony") track encoder.
++ *
++ * Turns plain sector data into the bitstream a Mac expects to read from
++ * a 3.5" GCR floppy, so sector images (.dsk, DiskCopy 4.2 .image) can be
++ * served through the same path as MOOF flux images.
++ *
++ * Pure C/C++, no platform dependencies. Ported unchanged from the FujiNet Mac
++ * firmware (fujinet-firmware lib/media/mac/macGCR.{h,cpp}), where it is
++ * verified by tests/mac_gcr_test.cpp; here the Mac floppy-port bus uses it to
++ * serve sector images as GCR tracks and to decode the Mac's writes.
++ *
++ * References: MAME src/lib/formats/ap_dsk35.cpp and flopimg.cpp (track
++ * format description), greaseweazle codec/macintosh (track layout as
++ * captured from real disks), Apple "Sony" driver documentation.
++ */
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define MAC_GCR_SECTOR_SIZE   512
++#define MAC_GCR_TAG_SIZE      12
++#define MAC_GCR_SECTOR_TOTAL  (MAC_GCR_TAG_SIZE + MAC_GCR_SECTOR_SIZE) // 524
++#define MAC_GCR_ENC_SECTOR    703   // 524 bytes -> 703 GCR nibbles incl. checksum
++
++#define MAC_GCR_CYLINDERS     80
++#define MAC_GCR_ZONES         5
++#define MAC_GCR_MAX_SECTORS   12
++#define MAC_GCR_BIT_TIMING    16    // x 125 ns = 2000 ns per bit cell
++
++#define MAC_GCR_FORMAT_SS     0x02  // format byte: single sided, 2:1 interleave
++#define MAC_GCR_FORMAT_DS     0x22  // format byte: double sided, 2:1 interleave
++
++#define MAC_GCR_400K_BYTES    409600
++#define MAC_GCR_800K_BYTES    819200
++
++// sectors per track in each of the five speed zones (16 cylinders each)
++int mac_gcr_sectors_per_track(int cyl);
++
++// total sectors before the given cylinder (one side), for image offsets
++int mac_gcr_sectors_before_cyl(int cyl);
++
++// bits per track for the cylinder's zone, matching a real disk spinning
++// at the zone's RPM with a 2 us bit cell. Always a multiple of 8.
++uint32_t mac_gcr_track_bits(int cyl);
++
++// bytes needed to hold a track of the given cylinder
++size_t mac_gcr_track_bytes(int cyl);
++
++// 6-and-2 encode one 6-bit value
++uint8_t mac_gcr_encode6(uint8_t v);
++
++/**
++ * Encode one 524-byte sector (12 tag + 512 data) into 703 GCR-ready
++ * 6-bit values (not yet passed through the 6&2 table).
++ */
++void mac_gcr_encode_sector(const uint8_t *in524, uint8_t *out703);
++
++/**
++ * Build a complete track bitstream.
++ *
++ *   sectors     nsec x 512 bytes of sector data in logical order
++ *   tags        nsec x 12 bytes of tag data, or NULL for zero tags
++ *   cyl, side   physical position
++ *   format      MAC_GCR_FORMAT_SS or MAC_GCR_FORMAT_DS
++ *   out         buffer of at least mac_gcr_track_bytes(cyl) bytes
++ *
++ * Returns the number of valid bits in `out` (== mac_gcr_track_bits(cyl)).
++ * Bits are stored MSB first, the same layout MOOF uses.
++ */
++uint32_t mac_gcr_encode_track(const uint8_t *sectors, const uint8_t *tags,
++                              int cyl, int side, uint8_t format,
++                              uint8_t *out, size_t out_size);
++
++/*
++ * ---- Write support -------------------------------------------------------
++ *
++ * The Mac writes a sector by re-writing only its data field (sync, data
++ * mark, sector number, 703 nibbles, epilogue) right after it has read the
++ * sector's address field; a format writes whole tracks, address fields
++ * included. The Pico captures the IWM's write stream as a bitstream
++ * (1 = flux transition, 2 us cells, MSB first) and hands it to the ESP32,
++ * which decodes it with mac_gcr_decode_capture(), stores the sector in the
++ * image file and patches the encoded track in place with
++ * mac_gcr_patch_sector(). Tracks built by mac_gcr_encode_track() are
++ * byte aligned, so a sector's 703 data nibbles sit at a fixed byte offset
++ * given by mac_gcr_sector_data_offset().
++ */
++
++// inverse of mac_gcr_encode6(); -1 if b is not a valid 6&2 code
++int mac_gcr_decode6(uint8_t b);
++
++// Inverse of mac_gcr_encode_sector(): 703 6-bit values (already passed
++// through mac_gcr_decode6) back to 12 tag + 512 data bytes. Returns 0 when
++// the Sony checksum matches, 1 otherwise (out524 is filled either way).
++int mac_gcr_decode_sector(const uint8_t *in703, uint8_t *out524);
++
++// Byte offset, in a track built by mac_gcr_encode_track() for `cyl` with
++// `format`, of the 703 encoded data nibbles of logical sector `sec`.
++// Returns 0 if sec is out of range for the cylinder.
++size_t mac_gcr_sector_data_offset(int cyl, uint8_t format, int sec);
++
++// Re-encode one sector's data field in place. in524 = 12 tag + 512 data.
++bool mac_gcr_patch_sector(uint8_t *track, size_t track_size, int cyl,
++                          uint8_t format, int sec, const uint8_t *in524);
++
++struct mac_gcr_written_sector
++{
++    int sector;         // sector number from the data field
++    int cyl;            // from the address field that preceded it, or -1
++    int side;           // from the address field, or -1
++    uint8_t format;     // from the address field, or 0
++    bool checksum_ok;   // data field checksum matched
++    uint8_t data[MAC_GCR_SECTOR_TOTAL]; // 12 tag + 512 data
++};
++
++/**
++ * Decode a captured write stream. `bits` holds nbits bits MSB first,
++ * 1 = flux transition, at any alignment (the marks are searched at every
++ * bit offset, like the IWM does). Every data field found is reported;
++ * a data field that directly follows an address field with the same
++ * sector number gets that field's cylinder/side (a format writes both).
++ * Returns the number of entries written to `out`.
++ */
++int mac_gcr_decode_capture(const uint8_t *bits, uint32_t nbits,
++                           mac_gcr_written_sector *out, int max_out);
+diff --git a/include/fujinet/io/devices/disk_device.h b/include/fujinet/io/devices/disk_device.h
+index 0e62505..eb495df 100644
+--- a/include/fujinet/io/devices/disk_device.h
++++ b/include/fujinet/io/devices/disk_device.h
+@@ -26,6 +26,9 @@ public:
+ 
+     void configure_boot_mount(std::string configUri, bool readOnly);
+     std::vector<std::size_t> restore_runtime_mounts();
++    // The host ejected the medium itself (a Mac floppy eject): flush and
++    // unmount the slot and forget it, so it is not restored at next start.
++    void eject(std::size_t slotIndex);
+     // Access to the underlying DiskService for boot/runtime mount application
+     disk::DiskService& disk_service() { return _svc; }
+     const disk::DiskService& disk_service() const { return _svc; }
 diff --git a/include/fujinet/io/transport/mac_floppy_framer.h b/include/fujinet/io/transport/mac_floppy_framer.h
 new file mode 100644
-index 0000000..00e7c7b
+index 0000000..f092460
 --- /dev/null
 +++ b/include/fujinet/io/transport/mac_floppy_framer.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,135 @@
 +#pragma once
 +
 +#include "fujinet/io/transport/iframer.h"
@@ -110,6 +259,7 @@ index 0000000..00e7c7b
 +#include <cstddef>
 +#include <cstdint>
 +#include <deque>
++#include <functional>
 +#include <vector>
 +
 +namespace fujinet::disk {
@@ -137,6 +287,28 @@ index 0000000..00e7c7b
 +//   FujiNet -> drive side (unsolicited)
 +//     'h' n           n units are mounted in a contiguous chain from unit 0
 +//
++// The 800K GCR floppy (DiskService slot FLOPPY_SLOT, a 400K or 800K sector
++// image), with the board's floppy commands:
++//
++//   drive side -> FujiNet
++//     '0' / '4'       step direction: inward / outward
++//     '1'             step                        -> track | 0x80, or 'N'
++//     '2' / '6'       motor on / off              -> 'M' / 'F'
++//     '7'             eject (the slot is unmounted) -> 'E'
++//   FujiNet -> drive side (unsolicited)
++//     's' t / 'd' t   single / double sided disk inserted, head at t | 0x80
++//     'u' / 'l'       writable / write protected
++//     'r'             disk removed
++//
++// On the board the ESP32 streams the encoded tracks from its RMT peripheral
++// and receives the Mac's writes as captured WR bitstreams. A drive side with
++// no such wires (an emulator) uses two more commands instead:
++//
++//     '#' cyl side               -> nbits(u32 BE), GCR track bits (MSB first)
++//     'P' cyl side nbits(u32 BE) <bits>
++//                                 a whole track as the Mac left it; the sectors
++//                                 are decoded and written   -> 'p' n (written)
++//
 +// FujiBus over the floppy port. Every DCD unit reports MAILBOX_BLOCKS more
 +// blocks than its image holds. Those blocks never reach the image: a write
 +// starting at the first of them carries one raw FujiBus packet from the Mac,
@@ -155,8 +327,12 @@ index 0000000..00e7c7b
 +    static constexpr std::size_t   MAILBOX_HEADER     = 16;
 +    static constexpr std::size_t   MAILBOX_MAX_PACKET = MAILBOX_BLOCKS * BLOCK_BYTES - MAILBOX_HEADER;
 +    static constexpr std::size_t   STATUS_BYTES       = 336;
++    static constexpr std::size_t   FLOPPY_SLOT        = 4;
 +
-+    explicit MacFloppyFramer(disk::DiskService& disks);
++    // onEject: the Mac ejected the medium in a slot. Defaults to a plain
++    // unmount; the disk device also forgets it so it is not restored.
++    explicit MacFloppyFramer(disk::DiskService& disks,
++                             std::function<void(std::size_t)> onEject = {});
 +
 +    void poll(Channel& ch) override;
 +    bool nextPacket(ByteBuffer& outPacket) override;
@@ -180,7 +356,15 @@ index 0000000..00e7c7b
 +    void mailbox_read(std::uint32_t index, std::uint8_t* out);
 +    void mailbox_write(std::uint32_t index, const std::uint8_t* in);
 +
++    // Floppy
++    int floppy_sides();                       // 1 or 2 when a Mac floppy is in, else 0
++    void announce_floppy(Channel& ch);
++    bool floppy_command(Channel& ch, std::uint8_t c);
++    std::vector<std::uint8_t> encode_track(int cyl, int side);
++    int write_track(int cyl, int side, const std::uint8_t* bits, std::uint32_t nbits);
++
 +    disk::DiskService& _disks;
++    std::function<void(std::size_t)> _onEject;
 +    std::deque<std::uint8_t> _rx;
 +    std::size_t _unit{0};
 +    int _announced{-1};
@@ -194,23 +378,29 @@ index 0000000..00e7c7b
 +    std::vector<std::uint8_t> _response;
 +    std::uint16_t _responseSeq{0};
 +    MailboxState _state{Idle};
++
++    // Floppy: what the drive side has been told, and the head position.
++    int _floppyAnnounced{0};                  // sides announced, 0 = none
++    int _head{0};
++    int _stepDir{1};
 +};
 +
 +} // namespace fujinet::io
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 5342d61..2d772d5 100644
+index 5342d61..712de18 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -85,6 +85,7 @@ idf_component_register(
+@@ -85,6 +85,8 @@ idf_component_register(
          lib/tnfs/tnfs_tcp_client.cpp
          lib/tnfs/tnfs_udp_client.cpp
          lib/transport/atari_sio_fujibus_framer.cpp
 +        lib/transport/mac_floppy_framer.cpp
++        lib/disk/mac_gcr.cpp
          lib/transport/legacy/byte_based_legacy_transport.cpp
          lib/transport/legacy/iwm_traits.cpp
          lib/transport/legacy/iwm_transport.cpp
 diff --git a/src/lib/bootstrap.cpp b/src/lib/bootstrap.cpp
-index befb86d..cfca879 100644
+index befb86d..db2fc08 100644
 --- a/src/lib/bootstrap.cpp
 +++ b/src/lib/bootstrap.cpp
 @@ -3,6 +3,10 @@
@@ -224,7 +414,7 @@ index befb86d..cfca879 100644
  #include "fujinet/config/fuji_config.h"
  // #include "fujinet/io/transport/iec_transport.h"
  // etc.
-@@ -79,6 +83,21 @@ io::ITransport* setup_transports(FujinetCore& core,
+@@ -79,6 +83,22 @@ io::ITransport* setup_transports(FujinetCore& core,
          // ...
          break;
      }
@@ -237,7 +427,8 @@ index befb86d..cfca879 100644
 +            FN_LOGE("bootstrap", "Mac floppy bus needs the disk device registered first");
 +            break;
 +        }
-+        auto* framer = new io::MacFloppyFramer(disk->disk_service());
++        auto* framer = new io::MacFloppyFramer(
++            disk->disk_service(), [disk](std::size_t slot) { disk->eject(slot); });
 +        auto* t = new io::FujiBusTransport(channel, *framer);
 +        core.addTransport(t);
 +        primary = t;
@@ -300,16 +491,493 @@ index a617d2e..be21fde 100644
          if (is_raw_extension(ext)) {
              DiskGeometry geometry{};
              if (opts.sectorSizeHint != 0 && (sizeBytes % opts.sectorSizeHint) == 0) {
+diff --git a/src/lib/disk/mac_gcr.cpp b/src/lib/disk/mac_gcr.cpp
+new file mode 100644
+index 0000000..8f5b205
+--- /dev/null
++++ b/src/lib/disk/mac_gcr.cpp
+@@ -0,0 +1,452 @@
++#include "fujinet/disk/mac_gcr.h"
++
++#include <string.h>
++
++// Apple 6-and-2 GCR code table: 6-bit value -> disk byte
++static const uint8_t gcr6_table[64] = {
++    0x96, 0x97, 0x9a, 0x9b, 0x9d, 0x9e, 0x9f, 0xa6,
++    0xa7, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb2, 0xb3,
++    0xb4, 0xb5, 0xb6, 0xb7, 0xb9, 0xba, 0xbb, 0xbc,
++    0xbd, 0xbe, 0xbf, 0xcb, 0xcd, 0xce, 0xcf, 0xd3,
++    0xd6, 0xd7, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde,
++    0xdf, 0xe5, 0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec,
++    0xed, 0xee, 0xef, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6,
++    0xf7, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
++};
++
++// Five self-sync "bytes" (1111111100) packed into six disk bytes.
++static const uint8_t self_sync[6] = {0xff, 0x3f, 0xcf, 0xf3, 0xfc, 0xff};
++
++static const uint8_t address_mark[3] = {0xd5, 0xaa, 0x96};
++static const uint8_t data_mark[3]    = {0xd5, 0xaa, 0xad};
++static const uint8_t address_epilogue[4] = {0xde, 0xaa, 0xff, 0xff};
++static const uint8_t data_epilogue[3]    = {0xde, 0xaa, 0xff};
++
++// sync groups before each address mark; a real drive writes roughly
++// 40 bytes of sync between sectors.
++#define SYNC_GROUPS_BEFORE_ADDRESS 5
++#define SYNC_GROUPS_BEFORE_DATA    1
++
++static const int zone_sectors[MAC_GCR_ZONES] = {12, 11, 10, 9, 8};
++
++// Bits per revolution per zone. The drive turns at 394/429/472/525/590
++// rpm in the five zones with a ~2 us bit cell. These figures are taken
++// from an Applesauce MOOF capture of a real 400K disk, rounded down to
++// a whole byte, so our tracks are exactly as long as real ones.
++static const uint32_t zone_bits[MAC_GCR_ZONES] = {74432, 68272, 61880, 55688, 49312};
++
++static inline int zone_of(int cyl)
++{
++    if (cyl < 0) cyl = 0;
++    if (cyl >= MAC_GCR_CYLINDERS) cyl = MAC_GCR_CYLINDERS - 1;
++    return cyl / 16;
++}
++
++int mac_gcr_sectors_per_track(int cyl)
++{
++    return zone_sectors[zone_of(cyl)];
++}
++
++int mac_gcr_sectors_before_cyl(int cyl)
++{
++    int n = 0;
++    for (int c = 0; c < cyl && c < MAC_GCR_CYLINDERS; c++)
++        n += zone_sectors[zone_of(c)];
++    return n;
++}
++
++uint32_t mac_gcr_track_bits(int cyl)
++{
++    return zone_bits[zone_of(cyl)];
++}
++
++size_t mac_gcr_track_bytes(int cyl)
++{
++    return (mac_gcr_track_bits(cyl) + 7) / 8;
++}
++
++uint8_t mac_gcr_encode6(uint8_t v)
++{
++    return gcr6_table[v & 0x3f];
++}
++
++/*
++ * Sony sector encoding: the 524 bytes are split into three interleaved
++ * streams, each byte is XORed with a running three-byte checksum, and the
++ * result is regrouped into 6-bit values (three 6-bit values plus one
++ * value carrying the three top bit pairs). Same algorithm as the ROM's
++ * Sony driver, MAME and FluxEngine/greaseweazle.
++ */
++void mac_gcr_encode_sector(const uint8_t *in, uint8_t *out)
++{
++    const int lookup_len = MAC_GCR_SECTOR_TOTAL / 3; // 174
++    uint8_t b1[lookup_len + 1];
++    uint8_t b2[lookup_len + 1];
++    uint8_t b3[lookup_len + 1];
++    const uint8_t *p = in;
++    uint32_t c1 = 0, c2 = 0, c3 = 0;
++
++    for (int j = 0;; j++)
++    {
++        c1 = (c1 & 0xff) << 1;
++        if (c1 & 0x100)
++            c1++;
++
++        uint8_t val = *p++;
++        c3 += val;
++        if (c1 & 0x100)
++        {
++            c3++;
++            c1 &= 0xff;
++        }
++        b1[j] = (val ^ c1) & 0xff;
++
++        val = *p++;
++        c2 += val;
++        if (c3 > 0xff)
++        {
++            c2++;
++            c3 &= 0xff;
++        }
++        b2[j] = (val ^ c3) & 0xff;
++
++        if ((p - in) == MAC_GCR_SECTOR_TOTAL)
++            break;
++
++        val = *p++;
++        c1 += val;
++        if (c2 > 0xff)
++        {
++            c1++;
++            c2 &= 0xff;
++        }
++        b3[j] = (val ^ c2) & 0xff;
++    }
++    uint8_t c4 = ((c1 & 0xc0) >> 6) | ((c2 & 0xc0) >> 4) | ((c3 & 0xc0) >> 2);
++    b3[lookup_len] = 0;
++
++    for (int i = 0; i <= lookup_len; i++)
++    {
++        uint8_t w1 = b1[i] & 0x3f;
++        uint8_t w2 = b2[i] & 0x3f;
++        uint8_t w3 = b3[i] & 0x3f;
++        uint8_t w4 = ((b1[i] & 0xc0) >> 2) | ((b2[i] & 0xc0) >> 4) | ((b3[i] & 0xc0) >> 6);
++
++        *out++ = w4;
++        *out++ = w1;
++        *out++ = w2;
++        if (i != lookup_len)
++            *out++ = w3;
++    }
++
++    *out++ = c4 & 0x3f;
++    *out++ = c3 & 0x3f;
++    *out++ = c2 & 0x3f;
++    *out++ = c1 & 0x3f;
++}
++
++// physical order of logical sectors on a track for the given interleave
++static void sector_order(int nsec, int interleave, int *order)
++{
++    for (int i = 0; i < nsec; i++)
++        order[i] = -1;
++    for (int i = 0, pos = 0; i < nsec; i++)
++    {
++        while (order[pos] != -1)
++            pos = (pos + 1) % nsec;
++        order[pos] = i;
++        pos = (pos + interleave) % nsec;
++    }
++}
++
++struct track_writer
++{
++    uint8_t *buf;
++    size_t cap;
++    size_t pos;
++
++    void put(uint8_t b) { if (pos < cap) buf[pos] = b; pos++; }
++    void put(const uint8_t *p, size_t n) { while (n--) put(*p++); }
++    void sync(int groups) { while (groups--) put(self_sync, sizeof(self_sync)); }
++};
++
++uint32_t mac_gcr_encode_track(const uint8_t *sectors, const uint8_t *tags,
++                              int cyl, int side, uint8_t format,
++                              uint8_t *out, size_t out_size)
++{
++    const int nsec = mac_gcr_sectors_per_track(cyl);
++    const uint32_t nbits = mac_gcr_track_bits(cyl);
++    const size_t nbytes = nbits / 8;
++    int interleave = format & 0x1f;
++    if (interleave < 1)
++        interleave = 1;
++
++    if (out == NULL || out_size < nbytes)
++        return 0;
++
++    memset(out, 0xff, nbytes);
++    track_writer w = {out, nbytes, 0};
++
++    // physical order of logical sectors on the track
++    int order[MAC_GCR_MAX_SECTORS];
++    sector_order(nsec, interleave, order);
++
++    uint8_t sec524[MAC_GCR_SECTOR_TOTAL];
++    uint8_t enc[MAC_GCR_ENC_SECTOR];
++
++    for (int i = 0; i < nsec; i++)
++    {
++        int sec = order[i];
++
++        // ---- address field ----
++        uint8_t hdr[5];
++        hdr[0] = cyl & 0x3f;
++        hdr[1] = (uint8_t)sec;
++        hdr[2] = (uint8_t)(((side & 1) << 5) | ((cyl >> 6) & 0x1f));
++        hdr[3] = format;
++        hdr[4] = hdr[0] ^ hdr[1] ^ hdr[2] ^ hdr[3];
++
++        w.sync(SYNC_GROUPS_BEFORE_ADDRESS);
++        w.put(address_mark, sizeof(address_mark));
++        for (int k = 0; k < 5; k++)
++            w.put(mac_gcr_encode6(hdr[k]));
++        w.put(address_epilogue, sizeof(address_epilogue));
++
++        // ---- data field ----
++        if (tags)
++            memcpy(sec524, tags + sec * MAC_GCR_TAG_SIZE, MAC_GCR_TAG_SIZE);
++        else
++            memset(sec524, 0, MAC_GCR_TAG_SIZE);
++        memcpy(sec524 + MAC_GCR_TAG_SIZE, sectors + sec * MAC_GCR_SECTOR_SIZE, MAC_GCR_SECTOR_SIZE);
++
++        mac_gcr_encode_sector(sec524, enc);
++
++        w.sync(SYNC_GROUPS_BEFORE_DATA);
++        w.put(data_mark, sizeof(data_mark));
++        w.put(mac_gcr_encode6((uint8_t)sec));
++        for (int k = 0; k < MAC_GCR_ENC_SECTOR; k++)
++            w.put(mac_gcr_encode6(enc[k]));
++        w.put(data_epilogue, sizeof(data_epilogue));
++    }
++
++    // The rest of the track, up to the index, is sync. Whole sync groups
++    // keep the 10-bit self-sync framing intact; any odd remainder is
++    // already 0xff from the memset.
++    while (w.pos + sizeof(self_sync) <= nbytes)
++        w.sync(1);
++
++    if (w.pos > nbytes)
++        return 0; // sectors did not fit; caller treats as failure
++
++    return nbits;
++}
++
++/* ------------------------------------------------------------------------
++ * Write support: decoding and in-place patching
++ * ---------------------------------------------------------------------- */
++
++int mac_gcr_decode6(uint8_t b)
++{
++    static int8_t inverse[256];
++    static bool init = false;
++    if (!init)
++    {
++        memset(inverse, -1, sizeof(inverse));
++        for (int i = 0; i < 64; i++)
++            inverse[gcr6_table[i]] = (int8_t)i;
++        init = true;
++    }
++    return inverse[b];
++}
++
++int mac_gcr_decode_sector(const uint8_t *in703, uint8_t *out524)
++{
++    const int lookup_len = MAC_GCR_SECTOR_TOTAL / 3;
++    uint8_t b1[lookup_len + 1], b2[lookup_len + 1], b3[lookup_len + 1];
++    const uint8_t *in = in703;
++
++    for (int i = 0; i <= lookup_len; i++)
++    {
++        uint8_t w4 = *in++;
++        uint8_t w1 = *in++;
++        uint8_t w2 = *in++;
++        uint8_t w3 = (i != lookup_len) ? *in++ : 0;
++        b1[i] = (w1 & 0x3f) | ((w4 << 2) & 0xc0);
++        b2[i] = (w2 & 0x3f) | ((w4 << 4) & 0xc0);
++        b3[i] = (w3 & 0x3f) | ((w4 << 6) & 0xc0);
++    }
++
++    uint32_t c1 = 0, c2 = 0, c3 = 0;
++    uint8_t *out = out524;
++    for (int count = 0;; count++)
++    {
++        c1 = (c1 & 0xff) << 1;
++        if (c1 & 0x100)
++            c1++;
++        uint8_t val = b1[count] ^ c1;
++        c3 += val;
++        if (c1 & 0x100) { c3++; c1 &= 0xff; }
++        *out++ = val;
++
++        val = b2[count] ^ c3;
++        c2 += val;
++        if (c3 > 0xff) { c2++; c3 &= 0xff; }
++        *out++ = val;
++        if ((out - out524) == MAC_GCR_SECTOR_TOTAL)
++            break;
++
++        val = b3[count] ^ c2;
++        c1 += val;
++        if (c2 > 0xff) { c1++; c2 &= 0xff; }
++        *out++ = val;
++    }
++    uint8_t c4 = ((c1 & 0xc0) >> 6) | ((c2 & 0xc0) >> 4) | ((c3 & 0xc0) >> 2);
++    uint8_t g4 = *in++, g3 = *in++, g2 = *in++, g1 = *in++;
++    return (g4 == (c4 & 0x3f) && g3 == (c3 & 0x3f) && g2 == (c2 & 0x3f) && g1 == (c1 & 0x3f)) ? 0 : 1;
++}
++
++// bytes per physical sector slot and the offset of the data nibbles in it,
++// mirroring the put()/sync() sequence in mac_gcr_encode_track()
++#define SLOT_ADDRESS_BYTES (SYNC_GROUPS_BEFORE_ADDRESS * (int)sizeof(self_sync) + \
++                            (int)sizeof(address_mark) + 5 + (int)sizeof(address_epilogue))
++#define SLOT_DATA_HEAD     (SYNC_GROUPS_BEFORE_DATA * (int)sizeof(self_sync) + (int)sizeof(data_mark) + 1)
++#define SLOT_BYTES         (SLOT_ADDRESS_BYTES + SLOT_DATA_HEAD + MAC_GCR_ENC_SECTOR + (int)sizeof(data_epilogue))
++
++size_t mac_gcr_sector_data_offset(int cyl, uint8_t format, int sec)
++{
++    const int nsec = mac_gcr_sectors_per_track(cyl);
++    int interleave = format & 0x1f;
++    if (interleave < 1)
++        interleave = 1;
++    if (sec < 0 || sec >= nsec)
++        return 0;
++
++    int order[MAC_GCR_MAX_SECTORS];
++    sector_order(nsec, interleave, order);
++    for (int slot = 0; slot < nsec; slot++)
++        if (order[slot] == sec)
++            return (size_t)slot * SLOT_BYTES + SLOT_ADDRESS_BYTES + SLOT_DATA_HEAD;
++    return 0;
++}
++
++bool mac_gcr_patch_sector(uint8_t *track, size_t track_size, int cyl,
++                          uint8_t format, int sec, const uint8_t *in524)
++{
++    size_t off = mac_gcr_sector_data_offset(cyl, format, sec);
++    if (track == NULL || off == 0 || off + MAC_GCR_ENC_SECTOR > track_size)
++        return false;
++
++    uint8_t enc[MAC_GCR_ENC_SECTOR];
++    mac_gcr_encode_sector(in524, enc);
++    for (int k = 0; k < MAC_GCR_ENC_SECTOR; k++)
++        track[off + k] = mac_gcr_encode6(enc[k]);
++    return true;
++}
++
++// read n bytes from a bitstream starting at bit `pos`; bits past the end read as 0
++static void capture_bytes(const uint8_t *bits, uint32_t nbits, uint32_t pos, uint8_t *out, int n)
++{
++    for (int i = 0; i < n; i++)
++    {
++        uint8_t v = 0;
++        for (int b = 0; b < 8; b++)
++        {
++            uint32_t p = pos + (uint32_t)i * 8 + b;
++            int bit = (p < nbits) ? ((bits[p / 8] >> (7 - (p % 8))) & 1) : 0;
++            v = (uint8_t)((v << 1) | bit);
++        }
++        out[i] = v;
++    }
++}
++
++int mac_gcr_decode_capture(const uint8_t *bits, uint32_t nbits,
++                           mac_gcr_written_sector *out, int max_out)
++{
++    int found = 0;
++    bool have_addr = false;
++    int a_cyl = -1, a_side = -1, a_sec = -1;
++    uint8_t a_format = 0;
++    uint8_t buf[1 + MAC_GCR_ENC_SECTOR];
++    uint8_t six[MAC_GCR_ENC_SECTOR];
++
++    if (bits == NULL || nbits < 24)
++        return 0;
++
++    for (uint32_t pos = 0; pos + 24 <= nbits && found < max_out;)
++    {
++        capture_bytes(bits, nbits, pos, buf, 3);
++        if (!(buf[0] == 0xd5 && buf[1] == 0xaa))
++        {
++            pos++;
++            continue;
++        }
++
++        if (buf[2] == 0x96)
++        {
++            // address field: cyl low, sector, side/cyl high, format, checksum
++            capture_bytes(bits, nbits, pos + 24, buf, 5);
++            int h[5];
++            bool ok = true;
++            for (int k = 0; k < 5; k++)
++            {
++                h[k] = mac_gcr_decode6(buf[k]);
++                if (h[k] < 0)
++                    ok = false;
++            }
++            if (ok && ((h[0] ^ h[1] ^ h[2] ^ h[3]) == h[4]))
++            {
++                a_cyl = h[0] | ((h[2] & 0x1f) << 6);
++                a_side = (h[2] >> 5) & 1;
++                a_sec = h[1];
++                a_format = (uint8_t)h[3];
++                have_addr = true;
++                pos += 24 + 5 * 8;
++                continue;
++            }
++            pos++;
++            continue;
++        }
++
++        if (buf[2] == 0xad)
++        {
++            // data field: sector number then 703 nibbles
++            capture_bytes(bits, nbits, pos + 24, buf, 1 + MAC_GCR_ENC_SECTOR);
++            int sec = mac_gcr_decode6(buf[0]);
++            bool ok = (sec >= 0 && sec < MAC_GCR_MAX_SECTORS);
++            for (int k = 0; k < MAC_GCR_ENC_SECTOR && ok; k++)
++            {
++                int v = mac_gcr_decode6(buf[1 + k]);
++                if (v < 0)
++                    ok = false;
++                else
++                    six[k] = (uint8_t)v;
++            }
++            if (!ok)
++            {
++                pos++;
++                continue;
++            }
++            mac_gcr_written_sector *w = &out[found++];
++            w->sector = sec;
++            w->checksum_ok = (mac_gcr_decode_sector(six, w->data) == 0);
++            if (have_addr && a_sec == sec)
++            {
++                w->cyl = a_cyl;
++                w->side = a_side;
++                w->format = a_format;
++            }
++            else
++            {
++                w->cyl = -1;
++                w->side = -1;
++                w->format = 0;
++            }
++            have_addr = false;
++            pos += 24 + (1 + MAC_GCR_ENC_SECTOR) * 8;
++            continue;
++        }
++
++        pos++;
++    }
++    return found;
++}
+diff --git a/src/lib/disk_device.cpp b/src/lib/disk_device.cpp
+index 88d9c0a..450f2c5 100644
+--- a/src/lib/disk_device.cpp
++++ b/src/lib/disk_device.cpp
+@@ -247,6 +247,13 @@ void DiskDevice::set_runtime_mount(std::size_t slotIndex, RuntimeMountState stat
+     save_runtime_mounts();
+ }
+ 
++void DiskDevice::eject(std::size_t slotIndex)
++{
++    _svc.flush(slotIndex);
++    _svc.unmount(slotIndex);
++    clear_runtime_mount(slotIndex);
++}
++
+ void DiskDevice::clear_runtime_mount(std::size_t slotIndex)
+ {
+     if (slotIndex >= _runtimeMounts.size()) return;
 diff --git a/src/lib/transport/mac_floppy_framer.cpp b/src/lib/transport/mac_floppy_framer.cpp
 new file mode 100644
-index 0000000..612c610
+index 0000000..9b1c314
 --- /dev/null
 +++ b/src/lib/transport/mac_floppy_framer.cpp
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,573 @@
 +#include "fujinet/io/transport/mac_floppy_framer.h"
 +
 +#include "fujinet/core/logging.h"
 +#include "fujinet/disk/disk_service.h"
++#include "fujinet/disk/mac_gcr.h"
 +
 +#include <algorithm>
 +#include <cstring>
@@ -366,8 +1034,10 @@ index 0000000..612c610
 +
 +} // namespace
 +
-+MacFloppyFramer::MacFloppyFramer(disk::DiskService& disks)
++MacFloppyFramer::MacFloppyFramer(disk::DiskService& disks,
++                                 std::function<void(std::size_t)> onEject)
 +    : _disks(disks)
++    , _onEject(std::move(onEject))
 +{
 +}
 +
@@ -386,6 +1056,7 @@ index 0000000..612c610
 +    }
 +
 +    announce_units(ch, false);
++    announce_floppy(ch);
 +}
 +
 +bool MacFloppyFramer::nextPacket(ByteBuffer& outPacket)
@@ -423,9 +1094,52 @@ index 0000000..612c610
 +
 +    switch (c) {
 +    case '?':
++        // A drive side (re)connecting: tell it everything afresh.
 +        _rx.pop_front();
++        _floppyAnnounced = 0;
 +        announce_units(ch, true);
 +        return true;
++
++    case '0': case '1': case '2': case '4': case '6': case '7':
++        _rx.pop_front();
++        return floppy_command(ch, c);
++
++    case '#': {
++        if (_rx.size() < 3) {
++            return false;
++        }
++        const int cyl = _rx[1];
++        const int side = _rx[2];
++        _rx.erase(_rx.begin(), _rx.begin() + 3);
++        const std::vector<std::uint8_t> track = encode_track(cyl, side);
++        std::uint8_t len[4];
++        put_be32(len, std::uint32_t(track.size() * 8));
++        ch.write(len, sizeof(len));
++        if (!track.empty()) {
++            ch.write(track.data(), track.size());
++        }
++        return true;
++    }
++
++    case 'P': {
++        if (_rx.size() < 7) {
++            return false;
++        }
++        const std::uint32_t nbits = (std::uint32_t(_rx[3]) << 24) | (std::uint32_t(_rx[4]) << 16) |
++                                    (std::uint32_t(_rx[5]) << 8) | _rx[6];
++        const std::size_t nbytes = (nbits + 7) / 8;
++        if (_rx.size() < 7 + nbytes) {
++            return false;
++        }
++        const int cyl = _rx[1];
++        const int side = _rx[2];
++        std::vector<std::uint8_t> bits(_rx.begin() + 7, _rx.begin() + 7 + nbytes);
++        _rx.erase(_rx.begin(), _rx.begin() + 7 + nbytes);
++        const int n = write_track(cyl, side, bits.data(), nbits);
++        const std::uint8_t reply[2] = {'p', std::uint8_t(n < 0 ? 0 : n)};
++        ch.write(reply, sizeof(reply));
++        return true;
++    }
 +
 +    case 'T': {
 +        _rx.pop_front();
@@ -463,9 +1177,8 @@ index 0000000..612c610
 +    }
 +
 +    default:
-+        // Floppy (MCI) commands and anything else: the floppy side of the
-+        // board streams GCR from dedicated hardware, which this build does
-+        // not have. Consume the byte so the stream stays in step.
++        // Anything else (the board's write-capture frames among them, which
++        // need its WR capture wiring): consume the byte to stay in step.
 +        FN_LOGD(TAG, "ignoring drive-side byte 0x%02X", c);
 +        _rx.pop_front();
 +        return true;
@@ -490,7 +1203,7 @@ index 0000000..612c610
 +        // first access. The Mac probes its drives once, at boot, so open
 +        // them before the drive side asks how many there are.
 +        _pendingActivated = true;
-+        for (std::size_t u = 0; u < DCD_UNITS; ++u) {
++        for (std::size_t u = 0; u <= FLOPPY_SLOT; ++u) {
 +            if (_disks.get_pending_mount(u)) {
 +                const auto r = _disks.ensure_mounted(u);
 +                FN_LOGI(TAG, "unit %zu: pending mount %s", u, r.ok() ? "opened" : "failed");
@@ -517,6 +1230,170 @@ index 0000000..612c610
 +    _announced = n;
 +    const std::uint8_t msg[2] = {'h', std::uint8_t(n)};
 +    ch.write(msg, sizeof(msg));
++}
++
++int MacFloppyFramer::floppy_sides()
++{
++    const disk::DiskSlotInfo info = _disks.info(FLOPPY_SLOT);
++    if (!info.inserted) {
++        return 0;
++    }
++    const std::uint64_t bytes = std::uint64_t(info.geometry.sectorSize) * info.geometry.sectorCount;
++    if (bytes == MAC_GCR_400K_BYTES) {
++        return 1;
++    }
++    if (bytes == MAC_GCR_800K_BYTES) {
++        return 2;
++    }
++    return 0;
++}
++
++void MacFloppyFramer::announce_floppy(Channel& ch)
++{
++    const int sides = floppy_sides();
++    if (sides == _floppyAnnounced) {
++        return;
++    }
++    if (sides == 0) {
++        FN_LOGI(TAG, "floppy removed");
++        const std::uint8_t msg = 'r';
++        ch.write(&msg, 1);
++    } else {
++        const bool ro = _disks.info(FLOPPY_SLOT).readOnly;
++        FN_LOGI(TAG, "floppy inserted: %s, %s", sides == 2 ? "800K" : "400K",
++                ro ? "write protected" : "writable");
++        _head = 0;
++        const std::uint8_t msg[3] = {std::uint8_t(sides == 2 ? 'd' : 's'),
++                                     std::uint8_t(0x80 | _head), std::uint8_t(ro ? 'l' : 'u')};
++        ch.write(msg, sizeof(msg));
++    }
++    _floppyAnnounced = sides;
++}
++
++bool MacFloppyFramer::floppy_command(Channel& ch, std::uint8_t c)
++{
++    std::uint8_t reply = 0;
++
++    switch (c) {
++    case '0':
++        _stepDir = 1;
++        return true;
++    case '4':
++        _stepDir = -1;
++        return true;
++    case '1':
++        if (floppy_sides() == 0) {
++            reply = 'N';
++        } else {
++            _head = std::clamp(_head + _stepDir, 0, MAC_GCR_CYLINDERS - 1);
++            reply = std::uint8_t(0x80 | _head);
++        }
++        break;
++    case '2':
++        reply = 'M';
++        break;
++    case '6':
++        if (floppy_sides() != 0) {
++            _disks.flush(FLOPPY_SLOT);
++        }
++        reply = 'F';
++        break;
++    case '7':
++        // The Mac ejected the disk: clear the slot, as the FujiNet Mac
++        // firmware does. The drive side already knows, so no 'r'.
++        FN_LOGI(TAG, "floppy ejected by the Mac");
++        if (floppy_sides() != 0) {
++            if (_onEject) {
++                _onEject(FLOPPY_SLOT);
++            } else {
++                _disks.flush(FLOPPY_SLOT);
++                _disks.unmount(FLOPPY_SLOT);
++            }
++        }
++        _floppyAnnounced = 0;
++        reply = 'E';
++        break;
++    default:
++        return true;
++    }
++    ch.write(&reply, 1);
++    return true;
++}
++
++std::vector<std::uint8_t> MacFloppyFramer::encode_track(int cyl, int side)
++{
++    const int sides = floppy_sides();
++    if (sides == 0 || cyl < 0 || cyl >= MAC_GCR_CYLINDERS || side < 0 || side >= sides) {
++        return {};
++    }
++    const int nsec = mac_gcr_sectors_per_track(cyl);
++    const std::uint32_t first = std::uint32_t(mac_gcr_sectors_before_cyl(cyl) * sides + side * nsec);
++
++    // Sector images hold cylinders in order, both sides of a cylinder together.
++    std::vector<std::uint8_t> sectors(std::size_t(nsec) * MAC_GCR_SECTOR_SIZE);
++    for (int i = 0; i < nsec; ++i) {
++        read_block(FLOPPY_SLOT, first + std::uint32_t(i), sectors.data() + i * MAC_GCR_SECTOR_SIZE);
++    }
++
++    std::vector<std::uint8_t> track(mac_gcr_track_bytes(cyl));
++    const std::uint32_t nbits = mac_gcr_encode_track(
++        sectors.data(), nullptr, cyl, side,
++        sides == 2 ? MAC_GCR_FORMAT_DS : MAC_GCR_FORMAT_SS, track.data(), track.size());
++    track.resize(nbits / 8);
++    return track;
++}
++
++int MacFloppyFramer::write_track(int cyl, int side, const std::uint8_t* bits, std::uint32_t nbits)
++{
++    const int sides = floppy_sides();
++    if (sides == 0 || cyl < 0 || cyl >= MAC_GCR_CYLINDERS || side < 0 || side >= sides) {
++        return 0;
++    }
++    if (_disks.info(FLOPPY_SLOT).readOnly) {
++        FN_LOGW(TAG, "floppy is write protected; track %d.%d not written", cyl, side);
++        return 0;
++    }
++
++    // Decode the track twice over so a field written across the index
++    // (the end of the bitstream) is found too.
++    std::vector<std::uint8_t> twice(bits, bits + (nbits + 7) / 8);
++    std::uint32_t total = nbits;
++    if (nbits % 8 == 0) {
++        twice.insert(twice.end(), bits, bits + nbits / 8);
++        total = nbits * 2;
++    }
++    std::vector<mac_gcr_written_sector> found(MAC_GCR_MAX_SECTORS * 3);
++    const int n = mac_gcr_decode_capture(twice.data(), total, found.data(), int(found.size()));
++
++    const int nsec = mac_gcr_sectors_per_track(cyl);
++    std::uint32_t done = 0; // bit per sector
++    int written = 0;
++    for (int i = 0; i < n; ++i) {
++        const mac_gcr_written_sector& w = found[std::size_t(i)];
++        const int c = w.cyl >= 0 ? w.cyl : cyl;
++        const int sd = w.side >= 0 ? w.side : side;
++        if (!w.checksum_ok || c != cyl || sd != side || w.sector >= nsec || (done & (1u << w.sector))) {
++            continue;
++        }
++        done |= 1u << w.sector;
++
++        const std::uint32_t lba =
++            std::uint32_t(mac_gcr_sectors_before_cyl(cyl) * sides + side * nsec + w.sector);
++        std::uint8_t current[BLOCK_BYTES];
++        read_block(FLOPPY_SLOT, lba, current);
++        const std::uint8_t* data = w.data + MAC_GCR_TAG_SIZE;
++        if (std::memcmp(current, data, BLOCK_BYTES) == 0) {
++            continue;
++        }
++        if (write_block(FLOPPY_SLOT, lba, data)) {
++            ++written;
++        }
++    }
++    if (written > 0) {
++        _disks.flush(FLOPPY_SLOT);
++        FN_LOGI(TAG, "floppy track %d.%d: %d sector(s) written", cyl, side, written);
++    }
++    return written;
 +}
 +
 +void MacFloppyFramer::read_block(std::size_t unit, std::uint32_t block, std::uint8_t* out)

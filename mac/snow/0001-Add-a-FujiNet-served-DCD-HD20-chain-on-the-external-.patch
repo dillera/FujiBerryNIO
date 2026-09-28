@@ -1,8 +1,8 @@
 From caea6c15022a6a91ea1e7bdb3f06fe41b42f8863 Mon Sep 17 00:00:00 2001
 From: Andrew Diller <dillera@dillernet.com>
 Date: Sun, 27 Sep 2026 22:23:43 -0400
-Subject: [PATCH] Add a FujiNet-served DCD (HD20) chain on the external drive
- port
+Subject: [PATCH 1/2] Add a FujiNet-served DCD (HD20) chain on the external
+ drive port
 
 The drive side of the Directly Connected Disk protocol, bit-timed through
 the IWM like a real device: phase states 0-7, !HSHK on the sense line,

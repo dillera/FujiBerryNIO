@@ -28,3 +28,19 @@ for app in "$HERE"/apps/*/build/*.bin; do
 done
 hls -l
 humount
+
+# An 800K floppy for NIO's floppy slot (5), with the apps too.
+FLOPPY=$(dirname "$IMG")/Floppy800.dsk
+dd if=/dev/zero of="$FLOPPY" bs=1024 count=800 2>/dev/null
+hformat -l "NIO Floppy" "$FLOPPY" >/dev/null
+hmount "$FLOPPY" >/dev/null
+for app in "$HERE"/apps/*/build/*.bin; do
+  [ -f "$app" ] || continue
+  name=$(basename "$app" .bin)
+  case $name in *.code) continue ;; esac
+  hcopy -m "$app" ":$name"
+done
+humount
+
+# Forget runtime mounts from earlier runs: slot 0 comes from the config.
+rm -f "$(dirname "$IMG")/../fujinet-runtime-mounts.tsv"

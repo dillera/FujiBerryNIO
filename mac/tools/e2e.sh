@@ -37,6 +37,10 @@ run 1
 key 1f cmd
 run 30
 shot e2e-3-probe.png
+# quit to the Finder: the floppy the probe mounted is in the external drive
+click
+run 20
+shot e2e-4-floppy.png
 SCRIPT
 (cd run && SNOW_FUJINET_DCD=127.0.0.1:65510 "$FNRUN" e2e.fnrun)
 grep -c "fujibus: receive" run/nio.log | xargs echo "FujiBus requests from the Mac:"

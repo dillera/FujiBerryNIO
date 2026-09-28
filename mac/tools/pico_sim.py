@@ -48,6 +48,8 @@ class Bus:
         host, port = addr.split(":")
         self.s = socket.create_connection((host, int(port)), timeout=5)
         self.units = None
+        self.floppy = None
+        self.floppy_writable = None
 
     def recv_exact(self, n):
         out = bytearray()
@@ -70,6 +72,14 @@ class Bus:
                     self.s.setblocking(True)
                     self.units = self.recv_exact(1)[0]
                     self.s.setblocking(False)
+                elif b in (b"s", b"d"):
+                    self.s.setblocking(True)
+                    self.floppy = (1 if b == b"s" else 2, self.recv_exact(1)[0] & 0x7F)
+                    self.s.setblocking(False)
+                elif b in (b"u", b"l"):
+                    self.floppy_writable = b == b"u"
+                elif b == b"r":
+                    self.floppy = None
         except BlockingIOError:
             pass
         finally:
@@ -95,6 +105,24 @@ class Bus:
         self.drain()
         self.s.sendall(b"R" + block.to_bytes(3, "big"))
         return self.recv_exact(512)
+
+    def floppy_cmd(self, c):
+        self.drain()
+        self.s.sendall(c)
+        return self.recv_exact(1)
+
+    def track(self, cyl, side):
+        self.drain()
+        self.s.sendall(b"#" + bytes([cyl, side]))
+        nbits = int.from_bytes(self.recv_exact(4), "big")
+        return nbits, self.recv_exact(nbits // 8)
+
+    def put_track(self, cyl, side, nbits, data):
+        self.drain()
+        self.s.sendall(b"P" + bytes([cyl, side]) + nbits.to_bytes(4, "big") + data)
+        r = self.recv_exact(2)
+        assert r[:1] == b"p", r
+        return r[1]
 
     def write(self, block, data):
         assert len(data) == 512
@@ -158,6 +186,26 @@ def main():
     print(f"FujiBus clock GetTime over the mailbox: status {status}, "
           f"time {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(unix))} ({dt:.1f} ms)")
     assert status == 0 and abs(unix - time.time()) < 60
+
+    # Floppy: mount an 800K image in slot 5 through the mailbox (FujiBus
+    # DiskService Mount), then read a GCR track, write it back, eject.
+    uri = b"host:/mac/Floppy800.dsk"
+    payload = (bytes([1, 5, 0, 4]) + (512).to_bytes(2, "little") +
+               len(uri).to_bytes(2, "little") + uri)
+    status, _ = parse_fuji_response(fujibus_call(bus, base, 2, build_fuji_packet_decoded(0xFC, 0x01, payload)))
+    assert status == 0, f"mount status {status}"
+    time.sleep(0.1)
+    bus.drain()
+    print(f"floppy mounted over FujiBus: announced {bus.floppy}, writable {bus.floppy_writable}")
+    assert bus.floppy == (2, 0) and bus.floppy_writable
+    nbits, trk = bus.track(0, 0)
+    marks = sum(1 for i in range(len(trk) - 2) if trk[i:i + 3] == b"\xd5\xaa\x96")
+    print(f"cylinder 0 side 0: {nbits} bits, {marks} address marks")
+    assert nbits == 74432 and marks == 12
+    assert bus.put_track(0, 0, nbits, trk) == 0, "an unchanged track must write nothing"
+    assert bus.floppy_cmd(b"2") == b"M" and bus.floppy_cmd(b"1") == bytes([0x81])
+    assert bus.floppy_cmd(b"7") == b"E"
+    print("floppy: track round trip, step and eject OK")
     print("OK")
 
 

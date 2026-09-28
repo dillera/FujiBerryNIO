@@ -1,0 +1,440 @@
+From 100aabba29e8f768a13cff6f5db0168916f2173c Mon Sep 17 00:00:00 2001
+From: Andrew Diller <dillera@dillernet.com>
+Date: Sun, 27 Sep 2026 22:35:42 -0400
+Subject: [PATCH 2/2] FujiNet floppy in the external drive, GCR tracks from the
+ FujiNet
+
+The FujiNet announces its floppy slot on the same link as the DCD chain
+('s'/'d' inserted, 'u'/'l' writable, 'r' removed). The disk goes in the
+external drive, behind the chain, built from GCR tracks the FujiNet
+encodes ('#' cyl side). When the motor stops, tracks the Mac changed go
+back whole ('P') for the FujiNet to decode; a Mac eject is sent as the
+board's eject command ('7').
+
+snow_floppy: FloppyImage::from_bitstreams and track_bitstream.
+---
+ core/src/mac/swim/dcd.rs   | 111 ++++++++++++++++++++++++++++++---
+ core/src/mac/swim/drive.rs |  10 +++
+ core/src/mac/swim/mod.rs   | 124 +++++++++++++++++++++++++++++++++++++
+ floppy/src/lib.rs          |  31 ++++++++++
+ 4 files changed, 268 insertions(+), 8 deletions(-)
+
+diff --git a/core/src/mac/swim/dcd.rs b/core/src/mac/swim/dcd.rs
+index 8c10275..fb4746b 100644
+--- a/core/src/mac/swim/dcd.rs
++++ b/core/src/mac/swim/dcd.rs
+@@ -50,8 +50,9 @@ impl Link {
+         self.stream.read_exact(buf)
+     }
+ 
+-    /// Consumes unsolicited 'h' n announcements; returns the latest count.
+-    fn drain(&mut self) -> std::io::Result<Option<usize>> {
++    /// Consumes unsolicited announcements: 'h' n (DCD units) and the floppy
++    /// ones ('s'/'d' t, 'u'/'l', 'r'). Returns the latest unit count.
++    fn drain(&mut self, floppy: &mut VecDeque<FloppyEvent>) -> std::io::Result<Option<usize>> {
+         let mut units = None;
+         self.stream.set_nonblocking(true)?;
+         let mut b = [0u8; 1];
+@@ -63,13 +64,22 @@ impl Link {
+                         "FujiNet closed the link",
+                     ));
+                 }
+-                Ok(_) if b[0] == b'h' => {
++                Ok(_) if matches!(b[0], b'h' | b's' | b'd') => {
+                     self.stream.set_nonblocking(false)?;
+                     let mut n = [0u8; 1];
+                     self.stream.read_exact(&mut n)?;
+-                    units = Some(n[0] as usize);
++                    match b[0] {
++                        b'h' => units = Some(n[0] as usize),
++                        c => floppy.push_back(FloppyEvent::Inserted {
++                            sides: if c == b'd' { 2 } else { 1 },
++                        }),
++                    }
+                     self.stream.set_nonblocking(true)?;
+                 }
++                Ok(_) if b[0] == b'u' || b[0] == b'l' => {
++                    floppy.push_back(FloppyEvent::Writable(b[0] == b'u'))
++                }
++                Ok(_) if b[0] == b'r' => floppy.push_back(FloppyEvent::Removed),
+                 Ok(_) => warn!("DCD: unexpected byte {:02X} from FujiNet", b[0]),
+                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break Ok(units),
+                 Err(e) => break Err(e),
+@@ -79,8 +89,8 @@ impl Link {
+         result
+     }
+ 
+-    fn query_units(&mut self) -> std::io::Result<usize> {
+-        self.drain()?;
++    fn query_units(&mut self, floppy: &mut VecDeque<FloppyEvent>) -> std::io::Result<usize> {
++        self.drain(floppy)?;
+         self.stream.write_all(b"?")?;
+         let mut r = [0u8; 2];
+         self.read_exact(&mut r)?;
+@@ -113,6 +123,36 @@ impl Link {
+         Ok(ack[0] == b'w')
+     }
+ 
++    /// A floppy command byte ('7' eject ...); returns the reply byte.
++    fn floppy_command(&mut self, c: u8) -> std::io::Result<u8> {
++        self.stream.write_all(&[c])?;
++        let mut r = [0u8; 1];
++        self.read_exact(&mut r)?;
++        Ok(r[0])
++    }
++
++    /// One GCR track, encoded by the FujiNet: (bytes, bits).
++    fn track(&mut self, cyl: usize, side: usize) -> std::io::Result<(Vec<u8>, usize)> {
++        self.stream.write_all(&[b'#', cyl as u8, side as u8])?;
++        let mut len = [0u8; 4];
++        self.read_exact(&mut len)?;
++        let bits = u32::from_be_bytes(len) as usize;
++        let mut data = vec![0u8; bits.div_ceil(8)];
++        self.read_exact(&mut data)?;
++        Ok((data, bits))
++    }
++
++    /// Sends a track back; returns how many sectors the FujiNet wrote.
++    fn put_track(&mut self, cyl: usize, side: usize, data: &[u8], bits: usize) -> std::io::Result<u8> {
++        let mut msg = vec![b'P', cyl as u8, side as u8];
++        msg.extend_from_slice(&(bits as u32).to_be_bytes());
++        msg.extend_from_slice(&data[..bits.div_ceil(8)]);
++        self.stream.write_all(&msg)?;
++        let mut r = [0u8; 2];
++        self.read_exact(&mut r)?;
++        Ok(r[1])
++    }
++
+     fn status(&mut self, unit: usize, out: &mut [u8; 336]) -> std::io::Result<()> {
+         self.select(unit)?;
+         self.stream.write_all(b"T")?;
+@@ -120,6 +160,14 @@ impl Link {
+     }
+ }
+ 
++/// Floppy news from the FujiNet, applied to the external drive by the SWIM.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FloppyEvent {
++    Inserted { sides: usize },
++    Writable(bool),
++    Removed,
++}
++
+ /// Where the device is in the DCD handshake.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+ enum Xfer {
+@@ -159,6 +207,8 @@ pub struct DcdChain {
+     /// Position in the daisy chain; `units` means the chain has passed on
+     /// to the floppy drive behind it.
+     pub pos: usize,
++    /// Floppy announcements not yet applied.
++    pub floppy_events: VecDeque<FloppyEvent>,
+     phase: u8,
+     hshk: bool,
+     xfer: Xfer,
+@@ -197,6 +247,7 @@ impl DcdChain {
+             last_connect: None,
+             units: 0,
+             pos: 0,
++            floppy_events: VecDeque::new(),
+             phase: 2,
+             hshk: false,
+             xfer: Xfer::Idle,
+@@ -231,7 +282,8 @@ impl DcdChain {
+             return;
+         };
+         self.last_connect = Some(Instant::now());
+-        match Link::connect(&addr).and_then(|mut l| l.query_units().map(|n| (l, n))) {
++        let events = &mut self.floppy_events;
++        match Link::connect(&addr).and_then(|mut l| l.query_units(events).map(|n| (l, n))) {
+             Ok((link, n)) => {
+                 self.units = n.min(MAX_UNITS);
+                 self.link = Some(link);
+@@ -260,7 +312,7 @@ impl DcdChain {
+             return;
+         }
+         match self.link.as_mut() {
+-            Some(link) => match link.drain() {
++            Some(link) => match link.drain(&mut self.floppy_events) {
+                 Ok(Some(n)) => {
+                     let n = n.min(MAX_UNITS);
+                     if n != self.units {
+@@ -282,6 +334,49 @@ impl DcdChain {
+         }
+     }
+ 
++    /// Fetches every track of the FujiNet's floppy, GCR encoded by it:
++    /// `[cylinder][side]`.
++    pub fn floppy_tracks(&mut self, sides: usize) -> Option<Vec<[Option<(Vec<u8>, usize)>; 2]>> {
++        let link = self.link.as_mut()?;
++        let mut tracks = Vec::with_capacity(80);
++        for cyl in 0..80 {
++            let mut t: [Option<(Vec<u8>, usize)>; 2] = [None, None];
++            for (side, slot) in t.iter_mut().enumerate().take(sides) {
++                match link.track(cyl, side) {
++                    Ok((data, bits)) if bits > 0 => *slot = Some((data, bits)),
++                    Ok(_) => (),
++                    Err(e) => {
++                        self.drop_link(e);
++                        return None;
++                    }
++                }
++            }
++            tracks.push(t);
++        }
++        Some(tracks)
++    }
++
++    /// Sends a written track back to the FujiNet; returns sectors written.
++    pub fn floppy_put_track(&mut self, cyl: usize, side: usize, data: &[u8], bits: usize) -> Option<u8> {
++        let link = self.link.as_mut()?;
++        match link.put_track(cyl, side, data, bits) {
++            Ok(n) => Some(n),
++            Err(e) => {
++                self.drop_link(e);
++                None
++            }
++        }
++    }
++
++    /// Tells the FujiNet the Mac ejected its floppy.
++    pub fn floppy_eject(&mut self) {
++        if let Some(link) = self.link.as_mut()
++            && let Err(e) = link.floppy_command(b'7')
++        {
++            self.drop_link(e);
++        }
++    }
++
+     /// The RD line as seen through the IWM sense bit.
+     pub fn sense(&self) -> bool {
+         match self.phase {
+diff --git a/core/src/mac/swim/drive.rs b/core/src/mac/swim/drive.rs
+index 5d9e8a5..2bdacec 100644
+--- a/core/src/mac/swim/drive.rs
++++ b/core/src/mac/swim/drive.rs
+@@ -325,6 +325,16 @@ impl FloppyDrive {
+         self.drive_type != DriveType::None
+     }
+ 
++    /// Returns true if a disk is in the drive
++    pub(super) fn has_disk(&self) -> bool {
++        self.floppy_inserted
++    }
++
++    /// Returns true if the motor is on (a disk in or not)
++    pub(super) fn motor_on(&self) -> bool {
++        self.motor
++    }
++
+     /// Returns true if drive's spindle motor is running
+     pub(super) fn is_running(&self) -> bool {
+         self.floppy_inserted && self.motor
+diff --git a/core/src/mac/swim/mod.rs b/core/src/mac/swim/mod.rs
+index 4cf3f51..090a22a 100644
+--- a/core/src/mac/swim/mod.rs
++++ b/core/src/mac/swim/mod.rs
+@@ -149,6 +149,10 @@ pub struct Swim {
+     pub(crate) dcd: dcd::DcdChain,
+     #[serde(skip)]
+     dcd_housekeeping: Ticks,
++    /// The external drive's disk came from the FujiNet: its tracks as last
++    /// synced, `[cylinder][side]`, to send back only what the Mac changed.
++    #[serde(skip)]
++    fujinet_floppy: Option<Vec<[Option<Vec<u8>>; 2]>>,
+ 
+     pub dbg_pc: u32,
+     pub dbg_break: LatchingEvent,
+@@ -210,6 +214,7 @@ impl Swim {
+             enable: false,
+             dcd: dcd::DcdChain::from_env(),
+             dcd_housekeeping: 0,
++            fujinet_floppy: None,
+             dbg_pc: 0,
+             dbg_break: LatchingEvent::default(),
+         }
+@@ -222,6 +227,117 @@ impl Swim {
+         self.mode == SwimMode::Iwm && self.enable && self.extdrive && self.dcd.pos < self.dcd.units()
+     }
+ 
++    /// The FujiNet's floppy goes in the external drive, behind the DCD chain.
++    const FUJINET_FLOPPY_DRIVE: usize = 1;
++
++    /// Applies the FujiNet's floppy announcements to the external drive and
++    /// sends back tracks the Mac wrote once its motor stops.
++    fn fujinet_floppy_housekeeping(&mut self) {
++        let mut insert = None;
++        let mut writable = true;
++        while let Some(ev) = self.dcd.floppy_events.pop_front() {
++            match ev {
++                dcd::FloppyEvent::Inserted { sides } => insert = Some(sides),
++                dcd::FloppyEvent::Writable(w) => writable = w,
++                dcd::FloppyEvent::Removed => {
++                    if self.fujinet_floppy.take().is_some()
++                        && self.drives[Self::FUJINET_FLOPPY_DRIVE].has_disk()
++                    {
++                        log::info!("FujiNet: floppy removed");
++                        self.drives[Self::FUJINET_FLOPPY_DRIVE].eject();
++                    }
++                }
++            }
++        }
++
++        if let Some(sides) = insert {
++            self.fujinet_floppy_insert(sides, writable);
++        }
++
++        let drv = &self.drives[Self::FUJINET_FLOPPY_DRIVE];
++        if self.fujinet_floppy.is_some() && drv.has_disk() && !drv.motor_on() && drv.floppy.is_dirty() {
++            self.fujinet_floppy_sync();
++        }
++    }
++
++    fn fujinet_floppy_insert(&mut self, sides: usize, writable: bool) {
++        let drive = Self::FUJINET_FLOPPY_DRIVE;
++        if !self.drives[drive].is_present() {
++            log::warn!("FujiNet: floppy offered but there is no external drive");
++            return;
++        }
++        if self.drives[drive].has_disk() {
++            log::warn!("FujiNet: floppy offered but the external drive is occupied");
++            return;
++        }
++        let Some(tracks) = self.dcd.floppy_tracks(sides) else {
++            return;
++        };
++        let floppy_type = if sides == 2 {
++            snow_floppy::FloppyType::Mac800K
++        } else {
++            snow_floppy::FloppyType::Mac400K
++        };
++        let mut img = FloppyImage::from_bitstreams(floppy_type, "FujiNet", |side, cyl| {
++            tracks.get(cyl).and_then(|t| t[side].clone())
++        });
++        if !writable {
++            img.set_force_wp();
++        }
++        let synced = tracks
++            .into_iter()
++            .map(|t| t.map(|s| s.map(|(data, _)| data)))
++            .collect();
++        match self.drives[drive].disk_insert(img) {
++            Ok(()) => {
++                log::info!(
++                    "FujiNet: {} floppy inserted in the external drive{}",
++                    if sides == 2 { "800K" } else { "400K" },
++                    if writable { "" } else { " (write protected)" }
++                );
++                self.fujinet_floppy = Some(synced);
++            }
++            Err(e) => log::error!("FujiNet: cannot insert floppy: {}", e),
++        }
++    }
++
++    /// Sends every track that differs from the FujiNet's copy back to it.
++    fn fujinet_floppy_sync(&mut self) {
++        let Some(mut synced) = self.fujinet_floppy.take() else {
++            return;
++        };
++        let drive = Self::FUJINET_FLOPPY_DRIVE;
++        let mut sectors = 0usize;
++        for (cyl, sides) in synced.iter_mut().enumerate() {
++            for (side, last) in sides.iter_mut().enumerate() {
++                let Some(prev) = last.as_mut() else {
++                    continue;
++                };
++                let Some((data, bits)) = self.drives[drive].floppy.track_bitstream(side, cyl) else {
++                    continue;
++                };
++                let bytes = &data[..bits.div_ceil(8)];
++                if prev.as_slice() == bytes {
++                    continue;
++                }
++                let current = bytes.to_vec();
++                match self.dcd.floppy_put_track(cyl, side, &current, bits) {
++                    Some(n) => sectors += n as usize,
++                    None => {
++                        self.fujinet_floppy = Some(synced);
++                        return;
++                    }
++                }
++                *prev = current;
++            }
++        }
++        self.drives[drive].floppy.clear_dirty();
++        if sectors > 0 {
++            log::info!("FujiNet: {} floppy sector(s) written back", sectors);
++        }
++        self.fujinet_floppy = Some(synced);
++    }
++
+     fn get_selected_drive_idx(&self) -> usize {
+         if self.mode == SwimMode::Iwm {
+             if self.extdrive {
+@@ -330,6 +446,13 @@ impl Tickable for Swim {
+                 unreachable!()
+             };
+             if eject_ticks < self.cycles {
++                if self.get_selected_drive_idx() == Self::FUJINET_FLOPPY_DRIVE
++                    && self.fujinet_floppy.is_some()
++                {
++                    self.fujinet_floppy_sync();
++                    self.dcd.floppy_eject();
++                    self.fujinet_floppy = None;
++                }
+                 self.get_selected_drive_mut().eject();
+             }
+         } else if !self.lstrb
+@@ -352,6 +475,7 @@ impl Tickable for Swim {
+         if self.dcd_housekeeping >= 800_000 {
+             self.dcd_housekeeping = 0;
+             self.dcd.housekeeping();
++            self.fujinet_floppy_housekeeping();
+         }
+ 
+         if self.get_selected_drive().is_running() {
+diff --git a/floppy/src/lib.rs b/floppy/src/lib.rs
+index a5c3b93..fbad0e9 100644
+--- a/floppy/src/lib.rs
++++ b/floppy/src/lib.rs
+@@ -209,6 +209,37 @@ impl FloppyImage {
+         img
+     }
+ 
++    /// Builds an image from ready-made bitstream tracks, MSB first: for
++    /// example GCR tracks encoded by a FujiNet. `tracks(side, track)` returns
++    /// a track's bytes and its length in bits, or `None` to leave it blank.
++    pub fn from_bitstreams(
++        floppy_type: FloppyType,
++        title: &str,
++        mut tracks: impl FnMut(usize, usize) -> Option<(Vec<u8>, usize)>,
++    ) -> Self {
++        let mut img = Self::new(floppy_type, title);
++        for side in 0..FLOPPY_MAX_SIDES {
++            for track in 0..FLOPPY_MAX_TRACKS {
++                if let Some((mut data, bits)) = tracks(side, track) {
++                    data.resize(bits / 8 + 1, 0xFF);
++                    img.bitlen[side][track] = bits;
++                    img.trackdata[side][track] = data;
++                    img.origtracktype[side][track] = OriginalTrackType::Bitstream;
++                }
++            }
++        }
++        img
++    }
++
++    /// A bitstream track's bytes (MSB first) and its length in bits, or
++    /// `None` for a flux track.
++    pub fn track_bitstream(&self, side: usize, track: usize) -> Option<(&[u8], usize)> {
++        match self.get_track_type(side, track) {
++            TrackType::Bitstream => Some((&self.trackdata[side][track], self.bitlen[side][track])),
++            TrackType::Flux => None,
++        }
++    }
++
+     /// Legacy function, kept for possible future differentiation to create
+     /// images faster.
+     pub fn new_empty(floppy_type: FloppyType, title: &str) -> Self {
+-- 
+2.51.0
+

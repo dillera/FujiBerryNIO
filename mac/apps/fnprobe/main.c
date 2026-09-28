@@ -26,6 +26,14 @@
 #define PROBE_URL "http://api.open-meteo.com/v1/forecast?latitude=40.71&longitude=-74.01&current=temperature_2m,wind_speed_10m&temperature_unit=fahrenheit"
 #endif
 
+/* Mounted into the FujiNet's floppy slot (5): it appears in the Mac's
+ * external drive. */
+#ifndef FLOPPY_URI
+#define FLOPPY_URI "host:/mac/Floppy800.dsk"
+#endif
+#define FLOPPY_SLOT 5
+#define DISK_TYPE_RAW 4
+
 #define LINE_H 12
 #define MARGIN 6
 
@@ -132,6 +140,22 @@ static void show_time(void)
         secs / 3600UL, (secs / 60UL) % 60UL, secs % 60UL);
 }
 
+static void mount_floppy(const char *uri)
+{
+    fn_disk_info_t info;
+    uint8_t r;
+
+    say("\nMount %s in slot %d (floppy)\n", uri, FLOPPY_SLOT);
+    memset(&info, 0, sizeof(info));
+    r = fn_disk_mount(FLOPPY_SLOT, uri, 0, DISK_TYPE_RAW, 512, &info);
+    if (r != FN_OK) {
+        say("mount failed: %s\n", fn_error_string(r));
+        return;
+    }
+    say("mounted: %lu sectors; it goes in the external drive\n",
+        (unsigned long)info.sector_count);
+}
+
 static void http_get(const char *url)
 {
     fn_handle_t h;
@@ -208,6 +232,7 @@ int main(void)
         say("FujiNet: found (HD20 mailbox)\n");
         show_time();
         http_get(PROBE_URL);
+        mount_floppy(FLOPPY_URI);
     }
 
     say("\nClick or press a key to quit.");
