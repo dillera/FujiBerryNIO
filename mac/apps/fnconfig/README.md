@@ -20,7 +20,7 @@ NIO's FujiDevice has none of the classic CONFIG commands (0xF4 host slots,
 
 | CONFIG | NIO |
 | --- | --- |
-| 8 host slots | AppStore (0xF1), namespace `mac-config`, key `hosts`: 8 x 32 bytes. If nothing is saved, the list is built from the filesystems that answer ListDirectory (`host:/mac/`, `flash:/`, `sd0:/`), plus `fujinet.online`. It is saved to the AppStore the first time a host is edited (E). |
+| 8 host slots | AppStore (0xF1), namespace `mac-config`, key `hosts`: 8 x 32 bytes. If nothing is saved, the list is built from the filesystems that answer ListDirectory (`host:/mac/`, `flash:/`, `sd0:/`), then the TNFS servers of mounted images (such as NIO's boot disk), then `fujinet.online`. It is saved to the AppStore the first time a host is edited (E). |
 | host entry | An NIO URI base (`host:/mac/`, `sd0:/games/`, `tnfs://server/path/`). A bare name means TNFS (`tnfs://name/`), and `SD` means `sd0:/`. |
 | open/seek/read/close directory | FileService (0xFE) ListDirectory (0x02), compact and sorted. The whole directory is read at open (up to 200 entries, 6 KB of names), cached by URI and paged locally. The end is the in-band 0x7F marker. Dot files are hidden. |
 | device slots | DiskService units 1-4 are the HD20s (HD1-HD4) and unit 5 is the 800K floppy (FD). Info (0x05) gives the state and ListMounts (0x0D) gives each unit's image URI. The host column is the host whose URI prefixes the image, or `boot` for NIO's config boot mount. |
@@ -110,3 +110,22 @@ A click selects a row, and a double-click opens it.
   for the session.
 * In the POSIX (emulator) setup the WiFi line reads "disabled": that is
   what NIO's WifiService reports there.
+
+## On the real Mac
+
+`FujiNet51.hda` (the TNFS boot disk in `APPLE/68k/RW`) has the DA in its
+System file. To add a second HD20:
+
+1. Open FujiNet CONFIG from the Apple menu. Host 2 is the boot disk's TNFS
+   server.
+2. Browse to an image and press Return. Pick a free HD slot (HD2 is
+   preselected) and press Return again.
+3. Restart the Mac. The ROM finds DCD units only at startup, so the new disk
+   appears after the restart. NIO keeps the mount in its runtime mounts.
+
+To update the boot disk:
+* Power the Mac off. The ESP32 can also be held in reset.
+* Take the image with `tools/tnfs_get.py`.
+* Install the DA with `tools/install_da.py`.
+* Put it back with `tools/tnfs_put.py`. `--base <the copy you took>` sends
+  only the changed blocks.

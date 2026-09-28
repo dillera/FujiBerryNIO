@@ -174,6 +174,22 @@ static uint8_t list_page(const char *uri, uint16_t start, uint16_t max)
     return resp.status;
 }
 
+static void load_mount_uris(void);
+
+/* add a host once; false when the list is full */
+static bool add_host(unsigned *n, const char *h)
+{
+    unsigned i;
+
+    for (i = 0; i < *n; ++i)
+        if (strcmp((const char *)g_hosts[i], h) == 0)
+            return true;
+    if (*n >= NUM_HOST_SLOTS || strlen(h) >= sizeof(g_hosts[0]))
+        return *n < NUM_HOST_SLOTS;
+    strcpy((char *)g_hosts[(*n)++], h);
+    return true;
+}
+
 static void default_hosts(void)
 {
     static const char *const fs[] = {"host:/mac/", "flash:/", "sd0:/"};
@@ -182,8 +198,24 @@ static void default_hosts(void)
     memset(g_hosts, 0, sizeof(g_hosts));
     for (i = 0; i < sizeof(fs) / sizeof(fs[0]); ++i)
         if (list_page(fs[i], 0, 64) == 0)
-            strcpy((char *)g_hosts[n++], fs[i]);
-    strcpy((char *)g_hosts[n], "fujinet.online");
+            add_host(&n, fs[i]);
+    /* the TNFS servers of mounted images, such as NIO's boot disk */
+    load_mount_uris();
+    for (i = 0; i < NUM_DEVICE_SLOTS; ++i) {
+        char h[sizeof(g_hosts[0])];
+        const char *s = g_uri[i], *e;
+
+        if (strncmp(s, "tnfs://", 7) != 0)
+            continue;
+        s += 7;
+        e = strchr(s, '/');
+        if (!e || e == s || (size_t)(e - s) >= sizeof(h))
+            continue;
+        memcpy(h, s, (size_t)(e - s));
+        h[e - s] = 0;
+        add_host(&n, h);
+    }
+    add_host(&n, "fujinet.online");
 }
 
 /* ---- WiFi and adapter -------------------------------------------- */
