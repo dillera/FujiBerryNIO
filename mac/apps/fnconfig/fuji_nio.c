@@ -433,7 +433,7 @@ static bool do_mount(uint8_t ds, const char *uri, uint8_t mode)
     if (!up() || ds >= NUM_DEVICE_SLOTS || !uri[0])
         return false;
     return fn_disk_mount((uint8_t)(ds + 1), uri, mode != MODE_WRITE,
-                         FN_DISK_TYPE_RAW, 512, &info) == FN_OK;
+                         FN_DISK_TYPE_AUTO, 512, &info) == FN_OK;
 }
 
 /* the UI's mode toggle: remount the image with the new mode */

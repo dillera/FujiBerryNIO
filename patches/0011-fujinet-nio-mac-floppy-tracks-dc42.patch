@@ -1,0 +1,454 @@
+diff --git a/CMakeLists_posix.cmake b/CMakeLists_posix.cmake
+index 8763341..b56e1ba 100644
+--- a/CMakeLists_posix.cmake
++++ b/CMakeLists_posix.cmake
+@@ -138,6 +138,7 @@ set(FUJINET_NIO_SOURCES
+         src/lib/disk/image_probers/fat_bpb_probe.cpp
+         src/lib/disk/image_probers/image_probe.cpp
+         src/lib/disk/image_registry.cpp
++        src/lib/disk/dc42_image.cpp
+         src/lib/disk/raw_image.cpp
+         src/lib/disk/ssd_image.cpp
+         src/lib/disk_device.cpp
+diff --git a/docs/mac_floppy_bus.md b/docs/mac_floppy_bus.md
+index 9a52428..8c8c221 100644
+--- a/docs/mac_floppy_bus.md
++++ b/docs/mac_floppy_bus.md
+@@ -30,11 +30,11 @@ Mac --IWM/DB-19--> drive side (Pico, or an emulator) --UART / TCP--> MacFloppyFr
+ | Build | Channel | Serves |
+ | --- | --- | --- |
+ | `mac-floppy-tcp-debug` (POSIX preset) | TCP server (`channel.tcp_port`) | HD20, floppy, FujiBus: for emulators such as Snow |
+-| `mac-floppy-fujimac-rev0` (ESP32-WROVER board) | UART2, 2 Mbaud, to the Pico | HD20 and FujiBus. The floppy waits for RMT track streaming |
++| `mac-floppy-fujimac-rev0` (ESP32-WROVER board) | UART2, 2 Mbaud, to the Pico | HD20, floppy (with a Pico that plays tracks), FujiBus |
+ 
+ Slots use the FujiBus DiskService numbering. Slots 1-4 are DCD units 0-3 (the
+ chain is the contiguous run of mounted slots from 1). Slot 5 is the floppy:
+-a 400K or 800K sector image.
++a 400K or 800K sector image, raw or DiskCopy 4.2.
+ 
+ ## Drive side <-> FujiNet
+ 
+@@ -49,8 +49,8 @@ a 400K or 800K sector image.
+ | `2` / `6` | `M` / `F` | floppy motor on / off |
+ | `7` | `E` | the Mac ejected the floppy (the slot is unmounted and forgotten) |
+ | `?` | `h` n (see `!`) | how many DCD units (fujinet-nio) |
+-| `#` cyl side | nbits (u32 BE), bits | one GCR track, MSB first (emulators) |
+-| `P` cyl side nbits bits | `p` n | a whole written track; changed sectors are written (emulators) |
++| `#` cyl side | `#`, nbits (u32 BE), bits | one GCR track, MSB first, encoded from the image on demand |
++| `P` cyl side nbits bits | `p` n | written bits (a whole track, or one captured write); changed sectors are written |
+ | `!` | none | polled mode (emulators) |
+ 
+ Unsolicited, from the FujiNet: `h` n (DCD units), `s`/`d` t (400K/800K
+@@ -63,13 +63,16 @@ each command. An emulator on a socket sends `!` instead: after that NIO
+ sends nothing unasked, and `?` answers `h` n f. Here f is the floppy: 0
+ none, 1 400K, 2 800K, plus 0x80 if it is write protected.
+ 
+-**The floppy.** On the board the ESP32 streams encoded tracks from its RMT
+-peripheral, and receives the Mac's writes as captured WR bitstreams. The
+-emulator commands replace those wires. `#` returns a track encoded from the
+-sector image. `P` takes a track as the Mac left it. NIO searches it for
+-address and data fields at every bit offset, twice around the track so a
+-field written across the index is found too. It writes each good sector that
+-differs from the image.
++**The floppy.** The drive side plays the GCR bitstream itself, one track at
++a time; NIO serves sectors, as for the HD20s. When the head settles on a
++track, the drive side asks for it with `#` cyl side. NIO reads that track's
++sectors from the image (only those: a TNFS image is never loaded whole) and
++returns them GCR-encoded. `P` takes bits the Mac wrote: a whole track from an
++emulator, or one captured write burst from the board's Pico. NIO searches
++them for address and data fields at every bit offset, twice around the track
++so a field written across the index is found too. It writes each good sector
++that differs from the image. Floppy images are raw 400K/800K sector images
++or DiskCopy 4.2 images.
+ 
+ ## FujiBus through the mailbox
+ 
+diff --git a/include/fujinet/disk/dc42_image.h b/include/fujinet/disk/dc42_image.h
+new file mode 100644
+index 0000000..4298c5c
+--- /dev/null
++++ b/include/fujinet/disk/dc42_image.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <memory>
++
++#include "fujinet/disk/disk_image.h"
++
++namespace fujinet::disk {
++
++// Apple DiskCopy 4.2 image: an 84-byte header, then 512-byte sectors, then
++// optional 12-byte tags (not used). Written sectors leave the header's
++// checksums stale, as other FujiNet firmware does.
++std::unique_ptr<IDiskImage> make_dc42_disk_image();
++
++// DiskCopy 4.2 header fields, for the image probe.
++struct Dc42Header {
++    std::uint32_t dataBytes{0};
++    std::uint32_t tagBytes{0};
++};
++
++// Parse the first 84 bytes of a file. False unless it is a DiskCopy 4.2
++// image whose data fits in `fileBytes`.
++bool parse_dc42_header(const std::uint8_t* header84, std::uint64_t fileBytes, Dc42Header& out) noexcept;
++
++} // namespace fujinet::disk
+diff --git a/include/fujinet/disk/disk_types.h b/include/fujinet/disk/disk_types.h
+index 32c21ba..29f15f2 100644
+--- a/include/fujinet/disk/disk_types.h
++++ b/include/fujinet/disk/disk_types.h
+@@ -12,6 +12,7 @@ enum class ImageType : std::uint8_t {
+     Ssd  = 2,
+     Dsd  = 3,
+     Raw  = 4, // flat sectors, no header (test-friendly)
++    DiskCopy42 = 5, // Apple DiskCopy 4.2 (Mac 400K/800K floppies)
+ };
+ 
+ enum class DiskError : std::uint8_t {
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 712de18..8539774 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -32,6 +32,7 @@ idf_component_register(
+         lib/disk/image_probers/fat_bpb_probe.cpp
+         lib/disk/image_probers/image_probe.cpp
+         lib/disk/image_registry.cpp
++        lib/disk/dc42_image.cpp
+         lib/disk/raw_image.cpp
+         lib/disk/ssd_image.cpp
+         lib/disk_device.cpp
+diff --git a/src/lib/bootstrap.cpp b/src/lib/bootstrap.cpp
+index 0b31778..5a08089 100644
+--- a/src/lib/bootstrap.cpp
++++ b/src/lib/bootstrap.cpp
+@@ -97,9 +97,9 @@ io::ITransport* setup_transports(FujinetCore& core,
+             return dynamic_cast<io::DiskDevice*>(devices.getDevice(
+                 io::protocol::to_device_id(io::protocol::WireDeviceId::DiskService)));
+         };
+-        // The floppy needs track streaming: only an emulator link (TCP)
+-        // has it so far.
+-        const bool serveFloppy = profile.primaryChannel == build::ChannelKind::TcpSocket;
++        // The drive side asks for each track ('#') and plays it itself: an
++        // emulator, or the board's Pico.
++        const bool serveFloppy = true;
+         auto* framer = new io::MacFloppyFramer(
+             [find_disk]() -> disk::DiskService* {
+                 auto* disk = find_disk();
+diff --git a/src/lib/diagnostic_disk_provider.cpp b/src/lib/diagnostic_disk_provider.cpp
+index eab849f..d951279 100644
+--- a/src/lib/diagnostic_disk_provider.cpp
++++ b/src/lib/diagnostic_disk_provider.cpp
+@@ -31,6 +31,7 @@ static const char* image_type_str(fujinet::disk::ImageType t) noexcept
+         case ImageType::Atr:  return "atr";
+         case ImageType::Ssd:  return "ssd";
+         case ImageType::Dsd:  return "dsd";
++        case ImageType::DiskCopy42: return "dc42";
+         case ImageType::Raw:  return "raw";
+     }
+     return "unknown";
+diff --git a/src/lib/disk/dc42_image.cpp b/src/lib/disk/dc42_image.cpp
+new file mode 100644
+index 0000000..6b1da83
+--- /dev/null
++++ b/src/lib/disk/dc42_image.cpp
+@@ -0,0 +1,126 @@
++#include "fujinet/disk/dc42_image.h"
++
++namespace fujinet::disk {
++
++namespace {
++
++static constexpr std::uint64_t DC42_HEADER_BYTES = 0x54;
++static constexpr std::uint16_t DC42_SECTOR_BYTES = 512;
++
++std::uint32_t be32(const std::uint8_t* p) noexcept
++{
++    return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) | (std::uint32_t(p[2]) << 8) | p[3];
++}
++
++class Dc42DiskImage final : public IDiskImage {
++public:
++    ImageType type() const noexcept override { return ImageType::DiskCopy42; }
++    DiskGeometry geometry() const noexcept override { return _geo; }
++    bool read_only() const noexcept override { return _readOnly; }
++
++    DiskResult mount(std::unique_ptr<fs::IFile> file, std::uint64_t sizeBytes, const MountOptions& opts) override
++    {
++        if (!file) return DiskResult{DiskError::OpenFailed};
++        std::uint8_t header[DC42_HEADER_BYTES]{};
++        Dc42Header h;
++        if (!file->seek(0) || file->read(header, sizeof(header)) != sizeof(header) ||
++            !parse_dc42_header(header, sizeBytes, h)) {
++            return DiskResult{DiskError::BadImage};
++        }
++        _file = std::move(file);
++        _readOnly = opts.readOnlyRequested;
++        _geo = {};
++        _geo.sectorSize = DC42_SECTOR_BYTES;
++        _geo.sectorCount = h.dataBytes / DC42_SECTOR_BYTES;
++        _stats = {};
++        return DiskResult{DiskError::None};
++    }
++
++    DiskResult unmount() override
++    {
++        _file.reset();
++        _geo = {};
++        _readOnly = true;
++        _stats = {};
++        return DiskResult{DiskError::None};
++    }
++
++    DiskResult read_sector(std::uint32_t lba, std::uint8_t* dst, std::size_t dstBytes) override
++    {
++        const DiskResult r = check(lba, dst, dstBytes);
++        if (!r.ok()) return r;
++        ++_stats.readOps;
++        ++_stats.seekOps;
++        if (!_file->seek(offset_of(lba)) || _file->read(dst, DC42_SECTOR_BYTES) != DC42_SECTOR_BYTES) {
++            return DiskResult{DiskError::IoError};
++        }
++        _stats.readBytes += DC42_SECTOR_BYTES;
++        return DiskResult{DiskError::None, DC42_SECTOR_BYTES};
++    }
++
++    DiskResult write_sector(std::uint32_t lba, const std::uint8_t* src, std::size_t srcBytes) override
++    {
++        if (_file && _readOnly) return DiskResult{DiskError::ReadOnly};
++        const DiskResult r = check(lba, src, srcBytes);
++        if (!r.ok()) return r;
++        ++_stats.writeOps;
++        ++_stats.seekOps;
++        if (!_file->seek(offset_of(lba)) || _file->write(src, DC42_SECTOR_BYTES) != DC42_SECTOR_BYTES) {
++            return DiskResult{DiskError::IoError};
++        }
++        _stats.writeBytes += DC42_SECTOR_BYTES;
++        return DiskResult{DiskError::None, DC42_SECTOR_BYTES};
++    }
++
++    DiskResult flush() override
++    {
++        if (!_file) return DiskResult{DiskError::NotMounted};
++        return DiskResult{_file->flush() ? DiskError::None : DiskError::IoError};
++    }
++
++    DiskImageStats image_stats() const noexcept override { return _stats; }
++    void reset_image_stats() noexcept override { _stats = {}; }
++
++private:
++    DiskResult check(std::uint32_t lba, const void* buf, std::size_t bytes) const
++    {
++        if (!_file) return DiskResult{DiskError::NotMounted};
++        if (!buf || bytes < DC42_SECTOR_BYTES) return DiskResult{DiskError::InvalidRequest};
++        if (lba >= _geo.sectorCount) return DiskResult{DiskError::OutOfRange};
++        return DiskResult{DiskError::None};
++    }
++
++    static std::uint64_t offset_of(std::uint32_t lba) noexcept
++    {
++        return DC42_HEADER_BYTES + std::uint64_t(lba) * DC42_SECTOR_BYTES;
++    }
++
++    std::unique_ptr<fs::IFile> _file;
++    DiskGeometry _geo{};
++    bool _readOnly{true};
++    DiskImageStats _stats{};
++};
++
++} // namespace
++
++bool parse_dc42_header(const std::uint8_t* h, std::uint64_t fileBytes, Dc42Header& out) noexcept
++{
++    // 64-byte Pascal name, data size, tag size, data and tag checksums,
++    // disk format, format byte, then the magic 0x0100.
++    if (fileBytes < DC42_HEADER_BYTES || h[0] > 63) return false;
++    if (h[0x52] != 0x01 || h[0x53] != 0x00) return false;
++    const std::uint32_t data = be32(h + 0x40);
++    const std::uint32_t tags = be32(h + 0x44);
++    if (data == 0 || data % DC42_SECTOR_BYTES != 0) return false;
++    if (DC42_HEADER_BYTES + std::uint64_t(data) + tags > fileBytes) return false;
++    out.dataBytes = data;
++    out.tagBytes = tags;
++    return true;
++}
++
++std::unique_ptr<IDiskImage> make_dc42_disk_image()
++{
++    return std::make_unique<Dc42DiskImage>();
++}
++
++} // namespace fujinet::disk
+diff --git a/src/lib/disk/image_probers/image_probe.cpp b/src/lib/disk/image_probers/image_probe.cpp
+index be21fde..33108d7 100644
+--- a/src/lib/disk/image_probers/image_probe.cpp
++++ b/src/lib/disk/image_probers/image_probe.cpp
+@@ -1,5 +1,6 @@
+ #include "fujinet/disk/image_probers/image_probe.h"
+ 
++#include "fujinet/disk/dc42_image.h"
+ #include "fujinet/disk/image_probers/fat_bpb_probe.h"
+ #include "fujinet/io/devices/byte_codec.h"
+ 
+@@ -115,6 +116,29 @@ public:
+     }
+ };
+ 
++// Apple DiskCopy 4.2, whatever its extension (.image, .img, .dsk, .dc42).
++class DiskCopy42Probe final : public IImageProbe {
++public:
++    ImageProbeResult probe(
++        fs::IFile& file,
++        std::uint64_t sizeBytes,
++        std::string_view,
++        const MountOptions&
++    ) const override
++    {
++        std::uint8_t header[0x54]{};
++        if (sizeBytes < sizeof(header) || !file.seek(0)) return {};
++        if (file.read(header, sizeof(header)) != sizeof(header)) return {};
++        Dc42Header h;
++        if (!parse_dc42_header(header, sizeBytes, h)) return {};
++
++        DiskGeometry geometry{};
++        geometry.sectorSize = 512;
++        geometry.sectorCount = h.dataBytes / 512;
++        return {true, ImageType::DiskCopy42, geometry, ImageProbeConfidence::Content};
++    }
++};
++
+ class ExtensionProbe final : public IImageProbe {
+ public:
+     ImageProbeResult probe(
+@@ -202,6 +226,7 @@ ProbeRegistry make_default_probe_registry()
+ {
+     ProbeRegistry registry;
+     registry.registerProbe(std::make_unique<AtrHeaderProbe>());
++    registry.registerProbe(std::make_unique<DiskCopy42Probe>());
+     registry.registerProbe(std::make_unique<FatBpbSectorSizeProbe>());
+     registry.registerProbe(std::make_unique<SsdDfsProbe>());
+     registry.registerProbe(std::make_unique<ExtensionProbe>());
+diff --git a/src/lib/disk/image_registry.cpp b/src/lib/disk/image_registry.cpp
+index 1a957d5..550c140 100644
+--- a/src/lib/disk/image_registry.cpp
++++ b/src/lib/disk/image_registry.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "fujinet/disk/atr_image.h"
+ #include "fujinet/disk/raw_image.h"
++#include "fujinet/disk/dc42_image.h"
+ #include "fujinet/disk/ssd_image.h"
+ 
+ namespace fujinet::disk {
+@@ -106,6 +107,7 @@ ImageRegistry make_default_image_registry()
+     reg.register_type(ImageType::Raw, [] { return make_raw_disk_image(); });
+     reg.register_type(ImageType::Atr, [] { return make_atr_disk_image(); });
+     reg.register_type(ImageType::Ssd, [] { return make_ssd_disk_image(); });
++    reg.register_type(ImageType::DiskCopy42, [] { return make_dc42_disk_image(); });
+     reg.register_type(ImageType::Dsd, [] { return std::make_unique<UnsupportedImage>(ImageType::Dsd); });
+ 
+     // Creators (blank image creation).
+diff --git a/src/lib/transport/mac_floppy_framer.cpp b/src/lib/transport/mac_floppy_framer.cpp
+index 2c31a26..909106f 100644
+--- a/src/lib/transport/mac_floppy_framer.cpp
++++ b/src/lib/transport/mac_floppy_framer.cpp
+@@ -202,8 +202,10 @@ bool MacFloppyFramer::handle_command(Channel& ch)
+         const int side = _rx[2];
+         _rx.erase(_rx.begin(), _rx.begin() + 3);
+         const std::vector<std::uint8_t> track = encode_track(cyl, side);
+-        std::uint8_t len[4];
+-        put_be32(len, std::uint32_t(track.size() * 8));
++        // '#' first: an announcement queued before the reply cannot be
++        // mistaken for its length.
++        std::uint8_t len[5] = {'#'};
++        put_be32(len + 1, std::uint32_t(track.size() * 8));
+         ch.write(len, sizeof(len));
+         if (!track.empty()) {
+             ch.write(track.data(), track.size());
+diff --git a/tests/test_mac_floppy_framer.cpp b/tests/test_mac_floppy_framer.cpp
+index f48ba0e..81b11b8 100644
+--- a/tests/test_mac_floppy_framer.cpp
++++ b/tests/test_mac_floppy_framer.cpp
+@@ -182,11 +182,12 @@ TEST_CASE("MacFloppyFramer: 800K floppy tracks, write-back and eject")
+     CHECK(rig.exchange({}) == std::vector<std::uint8_t>{'d', 0x80, 'u'});
+ 
+     auto reply = rig.exchange({'#', 0, 0});
+-    REQUIRE(reply.size() >= 4);
+-    const std::uint32_t nbits = (std::uint32_t(reply[0]) << 24) | (std::uint32_t(reply[1]) << 16) |
+-                                (std::uint32_t(reply[2]) << 8) | reply[3];
++    REQUIRE(reply.size() >= 5);
++    CHECK(reply[0] == '#');
++    const std::uint32_t nbits = (std::uint32_t(reply[1]) << 24) | (std::uint32_t(reply[2]) << 16) |
++                                (std::uint32_t(reply[3]) << 8) | reply[4];
+     CHECK(nbits == mac_gcr_track_bits(0));
+-    std::vector<std::uint8_t> track(reply.begin() + 4, reply.end());
++    std::vector<std::uint8_t> track(reply.begin() + 5, reply.end());
+     REQUIRE(track.size() == nbits / 8);
+ 
+     std::vector<mac_gcr_written_sector> found(24);
+@@ -236,3 +237,66 @@ TEST_CASE("MacFloppyFramer: polled mode sends nothing unasked")
+     CHECK(rig.exchange({}).empty());
+     CHECK(rig.exchange({'?'}) == std::vector<std::uint8_t>{'h', 0, 2});
+ }
++
++TEST_CASE("MacFloppyFramer: a DiskCopy 4.2 floppy is served from its sectors")
++{
++    Rig rig;
++    // An 800K DiskCopy 4.2 image with tags: header, data, then 12-byte tags.
++    const auto data = patterned(1600);
++    std::vector<std::uint8_t> dc42(0x54, 0);
++    const char name[] = "Test Disk";
++    dc42[0] = std::uint8_t(sizeof(name) - 1);
++    std::memcpy(dc42.data() + 1, name, sizeof(name) - 1);
++    auto put32 = [&](std::size_t at, std::uint32_t v) {
++        dc42[at] = std::uint8_t(v >> 24);
++        dc42[at + 1] = std::uint8_t(v >> 16);
++        dc42[at + 2] = std::uint8_t(v >> 8);
++        dc42[at + 3] = std::uint8_t(v);
++    };
++    put32(0x40, std::uint32_t(data.size()));
++    put32(0x44, 1600 * 12);
++    dc42[0x50] = 1;    // 800K
++    dc42[0x51] = 0x22; // format byte
++    dc42[0x52] = 0x01; // magic 0x0100
++    dc42[0x53] = 0x00;
++    dc42.insert(dc42.end(), data.begin(), data.end());
++    dc42.insert(dc42.end(), 1600 * 12, 0xEE);
++    rig.fs->file_bytes("/fl.image") = dc42;
++
++    REQUIRE(rig.disks->mount(MacFloppyFramer::FLOPPY_SLOT, "mem", "/fl.image", {}).ok());
++    CHECK(rig.disks->info(MacFloppyFramer::FLOPPY_SLOT).geometry.sectorCount == 1600);
++    CHECK(rig.exchange({}) == std::vector<std::uint8_t>{'d', 0x80, 'u'});
++
++    // Cylinder 1, side 1: its sectors come from the data, past the header.
++    auto reply = rig.exchange({'#', 1, 1});
++    REQUIRE(reply.size() > 5);
++    REQUIRE(reply[0] == '#');
++    const std::uint32_t nbits = (std::uint32_t(reply[1]) << 24) | (std::uint32_t(reply[2]) << 16) |
++                                (std::uint32_t(reply[3]) << 8) | reply[4];
++    std::vector<std::uint8_t> track(reply.begin() + 5, reply.end());
++    std::vector<mac_gcr_written_sector> found(24);
++    const int n = mac_gcr_decode_capture(track.data(), nbits, found.data(), int(found.size()));
++    REQUIRE(n == mac_gcr_sectors_per_track(1));
++    const int nsec = mac_gcr_sectors_per_track(1);
++    for (int i = 0; i < n; ++i) {
++        const auto& w = found[std::size_t(i)];
++        const std::size_t lba = std::size_t(mac_gcr_sectors_before_cyl(1) * 2 + nsec + w.sector);
++        CHECK(std::memcmp(w.data + MAC_GCR_TAG_SIZE, data.data() + lba * 512, 512) == 0);
++    }
++
++    // A written sector lands in the data area, not over the header or tags.
++    std::uint8_t sector[MAC_GCR_SECTOR_TOTAL];
++    std::memset(sector, 0, MAC_GCR_TAG_SIZE);
++    std::memset(sector + MAC_GCR_TAG_SIZE, 0x5C, MAC_GCR_SECTOR_SIZE);
++    REQUIRE(mac_gcr_patch_sector(track.data(), track.size(), 1, MAC_GCR_FORMAT_DS, 2, sector));
++    std::vector<std::uint8_t> cmd{'P', 1, 1, std::uint8_t(nbits >> 24), std::uint8_t(nbits >> 16),
++                                  std::uint8_t(nbits >> 8), std::uint8_t(nbits)};
++    cmd.insert(cmd.end(), track.begin(), track.end());
++    CHECK(rig.exchange(cmd) == std::vector<std::uint8_t>{'p', 1});
++    const auto& file = rig.fs->file_bytes("/fl.image");
++    const std::size_t lba = std::size_t(mac_gcr_sectors_before_cyl(1) * 2 + nsec + 2);
++    CHECK(file[0x54 + lba * 512] == 0x5C);
++    CHECK(file[0x54 + lba * 512 + 511] == 0x5C);
++    CHECK(file[0] == sizeof(name) - 1);
++    CHECK(file[0x54 + 1600 * 512] == 0xEE);
++}
