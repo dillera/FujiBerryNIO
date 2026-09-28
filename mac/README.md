@@ -2,6 +2,8 @@
 
 **Architecture in full, including the first real-Mac boot: [NIO-ARCH.md](NIO-ARCH.md).**
 
+**FujiNet CONFIG as a desk accessory on NIO: [apps/fnconfig](apps/fnconfig/README.md).**
+
 fujinet-nio serving a 68000 Mac through its **floppy port**, as the FujiNet
 Mac firmware does:
 
@@ -130,6 +132,7 @@ the volume needs neither.
 | `mac/snow/*.patch` | Snow, also committed on branch `fujinet-dcd` of `~/code/snow`: (1) the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner; (2) the FujiNet floppy in the external drive; (3) polled mode on the link |
 | `mac/apps/fnprobe` | FujiNetProbe: clock, HTTP GET and a floppy mount through fujinet-nio-lib; a 56 KB Toolbox app |
 | `mac/apps/fndisks` | FujiNet Disks: browse images on NIO, mount into slots 1-5, eject; a 55 KB Toolbox app |
+| `mac/apps/fnconfig` | FujiNet CONFIG desk accessory (Apple menu): hosts, browsing, slots 1-5, mount and eject over NIO services; `tools/make-config-floppy.sh` installs it, `tools/config-e2e.sh` tests it |
 | `mac/tools/run-nio.sh` | Run NIO's Mac bus on `127.0.0.1:65510` (config in `run/fujinet-data/fujinet.yaml`) |
 | `mac/tools/run-snow.sh` | Snow GUI as a Mac Plus with the DCD chain (`SNOW_FUJINET_DCD`) |
 | `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume and the `NIO Floppy` 800K image, with the apps (NIO stopped); `BOOT_FROM=<floppy>` makes the HD20 bootable |
