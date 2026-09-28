@@ -1,5 +1,7 @@
 # FujiNet NIO on the classic Macintosh (floppy port)
 
+**Architecture in full, including the first real-Mac boot: [NIO-ARCH.md](NIO-ARCH.md).**
+
 fujinet-nio serving a 68000 Mac through its **floppy port**, as the FujiNet
 Mac firmware does:
 

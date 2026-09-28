@@ -421,23 +421,29 @@ index 0e62505..eb495df 100644
      const disk::DiskService& disk_service() const { return _svc; }
 diff --git a/include/fujinet/io/transport/mac_floppy_framer.h b/include/fujinet/io/transport/mac_floppy_framer.h
 new file mode 100644
-index 0000000..d63cdac
+index 0000000..669395b
 --- /dev/null
 +++ b/include/fujinet/io/transport/mac_floppy_framer.h
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,171 @@
 +#pragma once
 +
 +#include "fujinet/io/transport/iframer.h"
 +
 +#include <array>
++#include <chrono>
 +#include <cstddef>
 +#include <cstdint>
 +#include <deque>
 +#include <functional>
++#include <memory>
 +#include <vector>
 +
 +namespace fujinet::disk {
 +class DiskService;
++}
++
++namespace fujinet::fs {
++class StorageManager;
 +}
 +
 +namespace fujinet::io {
@@ -521,6 +527,13 @@ index 0000000..d63cdac
 +                             std::function<void(std::size_t)> onEject = {},
 +                             bool serveFloppy = true);
 +
++    // The disks are looked up on first use: platforms register the disk
++    // device before or after setting up transports. Until `resolve` finds
++    // them (or if it never does) no disks are served.
++    MacFloppyFramer(std::function<disk::DiskService*()> resolve, fs::StorageManager& storage,
++                    std::function<void(std::size_t)> onEject = {}, bool serveFloppy = true);
++    ~MacFloppyFramer() override;
++
 +    void poll(Channel& ch) override;
 +    bool nextPacket(ByteBuffer& outPacket) override;
 +    void sendPacket(Channel& ch, const ByteBuffer& packet) override;
@@ -533,6 +546,7 @@ index 0000000..d63cdac
 +    bool handle_command(Channel& ch);
 +
 +    std::uint32_t image_blocks(std::size_t unit);
++    std::uint32_t mailbox_blocks(std::size_t unit);   // 0 when the disk is too big
 +    std::size_t count_units();
 +    void announce_units(Channel& ch, bool force);
 +
@@ -550,12 +564,19 @@ index 0000000..d63cdac
 +    std::vector<std::uint8_t> encode_track(int cyl, int side);
 +    int write_track(int cyl, int side, const std::uint8_t* bits, std::uint32_t nbits);
 +
-+    disk::DiskService& _disks;
++    disk::DiskService& disks();
++
++    disk::DiskService* _disks{nullptr};
++    std::function<disk::DiskService*()> _resolve;
++    fs::StorageManager* _storage{nullptr};
++    std::unique_ptr<disk::DiskService> _none;   // served until the disks are found
 +    std::function<void(std::size_t)> _onEject;
 +    std::deque<std::uint8_t> _rx;
++    std::size_t _rxSizeSeen{0};
++    std::chrono::steady_clock::time_point _rxLastGrowth{};
 +    std::size_t _unit{0};
 +    int _announced{-1};
-+    bool _pendingActivated{false};
++    std::chrono::steady_clock::time_point _nextPendingTry{};
 +
 +    // Mailbox: the request being assembled and the latest response.
 +    std::vector<std::uint8_t> _request;
@@ -577,10 +598,10 @@ index 0000000..d63cdac
 +} // namespace fujinet::io
 diff --git a/pio-build/ini/platforms/platformio-mac-floppy-fujimac-rev0.ini b/pio-build/ini/platforms/platformio-mac-floppy-fujimac-rev0.ini
 new file mode 100644
-index 0000000..4f28d07
+index 0000000..2f398c1
 --- /dev/null
 +++ b/pio-build/ini/platforms/platformio-mac-floppy-fujimac-rev0.ini
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,21 @@
 +[fujinet]
 +build_board    = mac-floppy-fujimac-rev0
 +
@@ -599,20 +620,33 @@ index 0000000..4f28d07
 +build_flags =
 +    ${env.build_flags}
 +    -DFN_BUILD_ESP32_MAC_FLOPPY
++    -DFN_DEBUG
 +    -DFN_PLATFORM_ESP32
 +board_build.cmake_extra_args = -D CONFIG_IDF_TARGET_ESP32=1
 diff --git a/pio-build/sdkconfig/00_platform_sdkconfig_map.txt b/pio-build/sdkconfig/00_platform_sdkconfig_map.txt
-index 7827a3b..aade33f 100644
+index 7827a3b..3f4bb08 100644
 --- a/pio-build/sdkconfig/00_platform_sdkconfig_map.txt
 +++ b/pio-build/sdkconfig/00_platform_sdkconfig_map.txt
 @@ -12,6 +12,7 @@ atari-nio-fujibus-sio-gpio-fujinet-v1-8mb=common,wifi,fatfs,fs-littlefs,fujibus-
  fujibus-gpio-rs232-cdc-log-s3-wroom-1-n16r8=common,wifi,fatfs,fs-littlefs,spiram-oct80,fujibus-gpio,log-cdc,cli-cdc
  fujibus-gpio-rs232-uart-log-s3-wroom-1-n16r8=common,wifi,fatfs,fs-littlefs,spiram-oct80,fujibus-gpio,log-uart,cli-uart
  fujibus-gpio-rs232-uart-log-rev0=common,wifi,fatfs,fs-littlefs,fujibus-gpio,log-uart,cli-uart
-+mac-floppy-fujimac-rev0=common,wifi,fatfs,fs-littlefs,fujibus-gpio,log-uart,cli-uart
++mac-floppy-fujimac-rev0=common,wifi,fatfs,fs-littlefs,fujibus-gpio,uart-iram,log-uart,cli-uart
  
  
  #################################################################
+diff --git a/pio-build/sdkconfig/uart-iram.defaults b/pio-build/sdkconfig/uart-iram.defaults
+new file mode 100644
+index 0000000..b4906d0
+--- /dev/null
++++ b/pio-build/sdkconfig/uart-iram.defaults
+@@ -0,0 +1,6 @@
++###########################################################################
++# UART interrupt in IRAM: runs while flash operations disable the cache, so
++# a fast UART link (the Mac board's 2 Mbaud Pico link) does not overflow.
++###########################################################################
++
++CONFIG_UART_ISR_IN_IRAM=y
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 5342d61..712de18 100644
 --- a/src/CMakeLists.txt
@@ -626,8 +660,39 @@ index 5342d61..712de18 100644
          lib/transport/legacy/byte_based_legacy_transport.cpp
          lib/transport/legacy/iwm_traits.cpp
          lib/transport/legacy/iwm_transport.cpp
+diff --git a/src/app/main_esp32.cpp b/src/app/main_esp32.cpp
+index 52177ad..603b8f7 100644
+--- a/src/app/main_esp32.cpp
++++ b/src/app/main_esp32.cpp
+@@ -383,6 +383,7 @@ extern "C" void app_main(void)
+     esp_log_level_set("fujibus",     ESP_LOG_INFO);
+     esp_log_level_set("io",          ESP_LOG_INFO);
+     esp_log_level_set("led",         ESP_LOG_INFO);
++    esp_log_level_set("macbus",      ESP_LOG_INFO);
+     esp_log_level_set("mount",       ESP_LOG_INFO);
+     esp_log_level_set("nio",         ESP_LOG_INFO);
+     esp_log_level_set("nio-wifi",    ESP_LOG_INFO);
+diff --git a/src/lib/boot_mount.cpp b/src/lib/boot_mount.cpp
+index 9fc0496..0951680 100644
+--- a/src/lib/boot_mount.cpp
++++ b/src/lib/boot_mount.cpp
+@@ -45,7 +45,13 @@ std::size_t apply_boot_mount(
+         return 0;
+     }
+ 
+-    if (!fs->exists(resolvedPath)) {
++    // A network image cannot be checked before the network is up (the boot
++    // mount is applied at startup, before WiFi connects): stage it anyway;
++    // the lazy mount opens it on first use.
++    const bool network = boot.configUri.rfind("tnfs://", 0) == 0 ||
++                         boot.configUri.rfind("http://", 0) == 0 ||
++                         boot.configUri.rfind("https://", 0) == 0;
++    if (!network && !fs->exists(resolvedPath)) {
+         FN_LOGW(TAG,
+                 "Boot config_uri '%s' resolved to missing path '%s'",
+                 boot.configUri.c_str(),
 diff --git a/src/lib/bootstrap.cpp b/src/lib/bootstrap.cpp
-index befb86d..d0a3308 100644
+index befb86d..0b31778 100644
 --- a/src/lib/bootstrap.cpp
 +++ b/src/lib/bootstrap.cpp
 @@ -3,6 +3,12 @@
@@ -643,31 +708,37 @@ index befb86d..d0a3308 100644
  #include "fujinet/config/fuji_config.h"
  // #include "fujinet/io/transport/iec_transport.h"
  // etc.
-@@ -79,6 +85,32 @@ io::ITransport* setup_transports(FujinetCore& core,
+@@ -79,6 +85,38 @@ io::ITransport* setup_transports(FujinetCore& core,
          // ...
          break;
      }
 +    case TransportKind::MacFloppy: {
 +        // The framer serves DCD blocks straight from the disk service and
 +        // hands mailbox packets to an ordinary FujiBus transport.
-+        // Normally the disk device is registered first, and the Mac's disks
-+        // are its slots. Without one (an embedder), serve an empty set of
-+        // slots so FujiBus still works.
-+        auto* disk = dynamic_cast<io::DiskDevice*>(core.deviceManager().getDevice(
-+            io::protocol::to_device_id(io::protocol::WireDeviceId::DiskService)));
++        // The Mac's disks are the disk device's slots. Platforms register
++        // that device before (POSIX) or after (ESP32) the transports, so the
++        // framer looks it up on first use; with none (an embedder) it serves
++        // no disks and FujiBus still works.
++        auto& devices = core.deviceManager();
++        auto find_disk = [&devices]() {
++            return dynamic_cast<io::DiskDevice*>(devices.getDevice(
++                io::protocol::to_device_id(io::protocol::WireDeviceId::DiskService)));
++        };
 +        // The floppy needs track streaming: only an emulator link (TCP)
 +        // has it so far.
 +        const bool serveFloppy = profile.primaryChannel == build::ChannelKind::TcpSocket;
-+        io::MacFloppyFramer* framer = nullptr;
-+        if (disk) {
-+            framer = new io::MacFloppyFramer(
-+                disk->disk_service(), [disk](std::size_t slot) { disk->eject(slot); },
-+                serveFloppy);
-+        } else {
-+            FN_LOGW("bootstrap", "Mac floppy bus: no disk device registered, no disks served");
-+            auto* disks = new disk::DiskService(core.storageManager(), disk::make_default_image_registry());
-+            framer = new io::MacFloppyFramer(*disks, {}, serveFloppy);
-+        }
++        auto* framer = new io::MacFloppyFramer(
++            [find_disk]() -> disk::DiskService* {
++                auto* disk = find_disk();
++                return disk ? &disk->disk_service() : nullptr;
++            },
++            core.storageManager(),
++            [find_disk](std::size_t slot) {
++                if (auto* disk = find_disk()) {
++                    disk->eject(slot);
++                }
++            },
++            serveFloppy);
 +        auto* t = new io::FujiBusTransport(channel, *framer);
 +        core.addTransport(t);
 +        primary = t;
@@ -1208,17 +1279,19 @@ index 88d9c0a..450f2c5 100644
      if (slotIndex >= _runtimeMounts.size()) return;
 diff --git a/src/lib/transport/mac_floppy_framer.cpp b/src/lib/transport/mac_floppy_framer.cpp
 new file mode 100644
-index 0000000..9b61e5c
+index 0000000..2c31a26
 --- /dev/null
 +++ b/src/lib/transport/mac_floppy_framer.cpp
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,654 @@
 +#include "fujinet/io/transport/mac_floppy_framer.h"
 +
 +#include "fujinet/core/logging.h"
 +#include "fujinet/disk/disk_service.h"
 +#include "fujinet/disk/mac_gcr.h"
++#include "fujinet/disk/image_registry.h"
 +
 +#include <algorithm>
++#include <chrono>
 +#include <cstring>
 +
 +namespace fujinet::io {
@@ -1276,10 +1349,40 @@ index 0000000..9b61e5c
 +MacFloppyFramer::MacFloppyFramer(disk::DiskService& disks,
 +                                 std::function<void(std::size_t)> onEject,
 +                                 bool serveFloppy)
-+    : _disks(disks)
-+    , _onEject(std::move(onEject))
-+    , _serveFloppy(serveFloppy)
 +{
++    _disks = &disks;
++    _onEject = std::move(onEject);
++    _serveFloppy = serveFloppy;
++}
++
++MacFloppyFramer::MacFloppyFramer(std::function<disk::DiskService*()> resolve,
++                                 fs::StorageManager& storage,
++                                 std::function<void(std::size_t)> onEject,
++                                 bool serveFloppy)
++{
++    _resolve = std::move(resolve);
++    _storage = &storage;
++    _onEject = std::move(onEject);
++    _serveFloppy = serveFloppy;
++}
++
++MacFloppyFramer::~MacFloppyFramer() = default;
++
++disk::DiskService& MacFloppyFramer::disks()
++{
++    if (!_disks && _resolve) {
++        _disks = _resolve();
++        if (_disks) {
++            _none.reset();
++        }
++    }
++    if (_disks) {
++        return *_disks;
++    }
++    if (!_none) {
++        _none = std::make_unique<disk::DiskService>(*_storage, disk::make_default_image_registry());
++    }
++    return *_none;
 +}
 +
 +void MacFloppyFramer::poll(Channel& ch)
@@ -1293,7 +1396,23 @@ index 0000000..9b61e5c
 +        _rx.insert(_rx.end(), buf, buf + n);
 +    }
 +
++    const auto now = std::chrono::steady_clock::now();
++    if (!_rx.empty() && _rx.size() != _rxSizeSeen) {
++        _rxSizeSeen = _rx.size();
++        _rxLastGrowth = now;
++    }
++
 +    while (!_rx.empty() && handle_command(ch)) {
++    }
++
++    // A command left incomplete for this long lost bytes on the way (a UART
++    // overrun): drop it so the link resyncs; the drive side retries.
++    if (_rx.empty()) {
++        _rxSizeSeen = 0;
++    } else if (now - _rxLastGrowth > std::chrono::milliseconds(200)) {
++        FN_LOGW(TAG, "dropping %zu byte(s) of an incomplete command 0x%02X", _rx.size(), _rx.front());
++        _rx.clear();
++        _rxSizeSeen = 0;
 +    }
 +
 +    if (!_polled) {
@@ -1345,7 +1464,7 @@ index 0000000..9b61e5c
 +        _rx.pop_front();
 +        if (_polled) {
 +            const int sides = floppy_sides();
-+            const bool ro = sides && _disks.info(FLOPPY_SLOT).readOnly;
++            const bool ro = sides && disks().info(FLOPPY_SLOT).readOnly;
 +            const std::uint8_t reply[3] = {'h', std::uint8_t(count_units()),
 +                                           std::uint8_t(sides | (ro ? 0x80 : 0))};
 +            ch.write(reply, sizeof(reply));
@@ -1441,9 +1560,19 @@ index 0000000..9b61e5c
 +    }
 +}
 +
++// The Mac rejects HD20s of more than 65535 blocks; a volume that fills the
++// limit is served without a mailbox.
++static constexpr std::uint32_t kMaxHd20Blocks = 65535;
++
++std::uint32_t MacFloppyFramer::mailbox_blocks(std::size_t unit)
++{
++    const std::uint32_t blocks = image_blocks(unit);
++    return (blocks > 0 && blocks + MAILBOX_BLOCKS <= kMaxHd20Blocks) ? MAILBOX_BLOCKS : 0;
++}
++
 +std::uint32_t MacFloppyFramer::image_blocks(std::size_t unit)
 +{
-+    const disk::DiskSlotInfo info = _disks.info(unit);
++    const disk::DiskSlotInfo info = disks().info(unit);
 +    if (!info.inserted) {
 +        return 0;
 +    }
@@ -1454,15 +1583,18 @@ index 0000000..9b61e5c
 +
 +std::size_t MacFloppyFramer::count_units()
 +{
-+    if (!_pendingActivated) {
-+        // Config-defined (lazy) mounts, such as the boot disk, only open on
-+        // first access. The Mac probes its drives once, at boot, so open
-+        // them before the drive side asks how many there are.
-+        _pendingActivated = true;
++    // Config-defined (lazy) mounts, such as the boot disk, only open on
++    // first access. The Mac probes its drives at startup, so open them now;
++    // one on the network (TNFS) is retried until WiFi is up.
++    const auto now = std::chrono::steady_clock::now();
++    if ((disks(), _disks != nullptr) && now >= _nextPendingTry) {
++        // A failed network open blocks for its timeout: leave the loop room
++        // to bring the network up between tries.
++        _nextPendingTry = now + std::chrono::seconds(10);
 +        for (std::size_t u = 0; u <= FLOPPY_SLOT; ++u) {
-+            if (_disks.get_pending_mount(u)) {
-+                const auto r = _disks.ensure_mounted(u);
-+                FN_LOGI(TAG, "unit %zu: pending mount %s", u, r.ok() ? "opened" : "failed");
++            if (disks().get_pending_mount(u) && !disks().info(u).inserted) {
++                const auto r = disks().ensure_mounted(u);
++                FN_LOGI(TAG, "unit %zu: pending mount %s", u, r.ok() ? "opened" : "not ready yet");
 +            }
 +        }
 +    }
@@ -1493,7 +1625,7 @@ index 0000000..9b61e5c
 +    if (!_serveFloppy) {
 +        return 0;
 +    }
-+    const disk::DiskSlotInfo info = _disks.info(FLOPPY_SLOT);
++    const disk::DiskSlotInfo info = disks().info(FLOPPY_SLOT);
 +    if (!info.inserted) {
 +        return 0;
 +    }
@@ -1518,7 +1650,7 @@ index 0000000..9b61e5c
 +        const std::uint8_t msg = 'r';
 +        ch.write(&msg, 1);
 +    } else {
-+        const bool ro = _disks.info(FLOPPY_SLOT).readOnly;
++        const bool ro = disks().info(FLOPPY_SLOT).readOnly;
 +        FN_LOGI(TAG, "floppy inserted: %s, %s", sides == 2 ? "800K" : "400K",
 +                ro ? "write protected" : "writable");
 +        _head = 0;
@@ -1553,7 +1685,7 @@ index 0000000..9b61e5c
 +        break;
 +    case '6':
 +        if (floppy_sides() != 0) {
-+            _disks.flush(FLOPPY_SLOT);
++            disks().flush(FLOPPY_SLOT);
 +        }
 +        reply = 'F';
 +        break;
@@ -1565,8 +1697,8 @@ index 0000000..9b61e5c
 +            if (_onEject) {
 +                _onEject(FLOPPY_SLOT);
 +            } else {
-+                _disks.flush(FLOPPY_SLOT);
-+                _disks.unmount(FLOPPY_SLOT);
++                disks().flush(FLOPPY_SLOT);
++                disks().unmount(FLOPPY_SLOT);
 +            }
 +        }
 +        _floppyAnnounced = 0;
@@ -1608,7 +1740,7 @@ index 0000000..9b61e5c
 +    if (sides == 0 || cyl < 0 || cyl >= MAC_GCR_CYLINDERS || side < 0 || side >= sides) {
 +        return 0;
 +    }
-+    if (_disks.info(FLOPPY_SLOT).readOnly) {
++    if (disks().info(FLOPPY_SLOT).readOnly) {
 +        FN_LOGW(TAG, "floppy is write protected; track %d.%d not written", cyl, side);
 +        return 0;
 +    }
@@ -1649,7 +1781,7 @@ index 0000000..9b61e5c
 +        }
 +    }
 +    if (written > 0) {
-+        _disks.flush(FLOPPY_SLOT);
++        disks().flush(FLOPPY_SLOT);
 +        FN_LOGI(TAG, "floppy track %d.%d: %d sector(s) written", cyl, side, written);
 +    }
 +    return written;
@@ -1661,7 +1793,7 @@ index 0000000..9b61e5c
 +    const std::uint32_t blocks = image_blocks(unit);
 +
 +    if (block >= blocks) {
-+        if (blocks > 0 && block - blocks < MAILBOX_BLOCKS) {
++        if (block - blocks < mailbox_blocks(unit)) {
 +            mailbox_read(block - blocks, out);
 +        } else {
 +            FN_LOGW(TAG, "unit %zu: read of block %u beyond the disk", unit, (unsigned)block);
@@ -1669,14 +1801,14 @@ index 0000000..9b61e5c
 +        return;
 +    }
 +
-+    const disk::DiskSlotInfo info = _disks.info(unit);
++    const disk::DiskSlotInfo info = disks().info(unit);
 +    const std::uint16_t ss = info.geometry.sectorSize;
 +    if (ss == 0 || BLOCK_BYTES % ss != 0) {
 +        FN_LOGW(TAG, "unit %zu: sector size %u cannot serve 512-byte blocks", unit, (unsigned)ss);
 +        return;
 +    }
 +    const std::uint32_t per = std::uint32_t(BLOCK_BYTES / ss);
-+    const auto r = _disks.read_sectors(unit, block * per, std::uint16_t(per), out, BLOCK_BYTES);
++    const auto r = disks().read_sectors(unit, block * per, std::uint16_t(per), out, BLOCK_BYTES);
 +    if (!r.ok()) {
 +        FN_LOGW(TAG, "unit %zu: read of block %u failed (%u)", unit, (unsigned)block, (unsigned)r.error);
 +    }
@@ -1687,7 +1819,7 @@ index 0000000..9b61e5c
 +    const std::uint32_t blocks = image_blocks(unit);
 +
 +    if (block >= blocks) {
-+        if (blocks > 0 && block - blocks < MAILBOX_BLOCKS) {
++        if (block - blocks < mailbox_blocks(unit)) {
 +            mailbox_write(block - blocks, in);
 +            return true;
 +        }
@@ -1695,13 +1827,13 @@ index 0000000..9b61e5c
 +        return false;
 +    }
 +
-+    const disk::DiskSlotInfo info = _disks.info(unit);
++    const disk::DiskSlotInfo info = disks().info(unit);
 +    const std::uint16_t ss = info.geometry.sectorSize;
 +    if (ss == 0 || BLOCK_BYTES % ss != 0) {
 +        return false;
 +    }
 +    const std::uint32_t per = std::uint32_t(BLOCK_BYTES / ss);
-+    const auto r = _disks.write_sectors(unit, block * per, std::uint16_t(per), in, BLOCK_BYTES);
++    const auto r = disks().write_sectors(unit, block * per, std::uint16_t(per), in, BLOCK_BYTES);
 +    if (!r.ok()) {
 +        FN_LOGW(TAG, "unit %zu: write of block %u failed (%u)", unit, (unsigned)block, (unsigned)r.error);
 +        return false;
@@ -1717,8 +1849,8 @@ index 0000000..9b61e5c
 +    std::uint8_t p[6 + STATUS_BYTES] = {}; // indexed with the payload offsets of the spec
 +
 +    const std::uint32_t blocks = image_blocks(unit);
-+    const disk::DiskSlotInfo info = _disks.info(unit);
-+    const std::uint32_t reported = blocks ? blocks + MAILBOX_BLOCKS : 0;
++    const disk::DiskSlotInfo info = disks().info(unit);
++    const std::uint32_t reported = blocks + mailbox_blocks(unit);
 +
 +    p[7] = 1;  // device type
 +    p[9] = 1;  // manufacturer
@@ -1894,6 +2026,22 @@ index 46fecdf..6108f1c 100644
  #else
  #  error "Invalid FN_PINMAP value"
  #endif
+diff --git a/src/platform/esp32/uart_channel.cpp b/src/platform/esp32/uart_channel.cpp
+index 9d2617b..d5b09f7 100644
+--- a/src/platform/esp32/uart_channel.cpp
++++ b/src/platform/esp32/uart_channel.cpp
+@@ -249,6 +249,11 @@ bool UartChannel::initialize()
+         return false;
+     }
+ 
++    // Drain the 128-byte hardware FIFO early. The driver's default (120)
++    // leaves 8 bytes of slack: 40 us at 2 Mbaud, less than WiFi can delay
++    // the interrupt, which drops bytes mid-packet.
++    (void)uart_set_rx_full_threshold(_uart_port, 32);
++
+     return true;
+ }
+ 
 diff --git a/tests/test_mac_floppy_framer.cpp b/tests/test_mac_floppy_framer.cpp
 new file mode 100644
 index 0000000..f48ba0e

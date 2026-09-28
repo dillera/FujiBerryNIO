@@ -13,8 +13,9 @@ Verified on **macOS 26.5.2 (arm64)**, Amiberry **8.3.0**, workspace
 [doc]: https://github.com/markjfisher/fujinet-nio-workspace/blob/master/docs/amiga/amiberry-testing.md
 
 **Macintosh:** the `mac` branch adds fujinet-nio on a 68000 Mac's floppy port
-(HD20 disks, and FujiBus commands through the IWM), tested in Snow. See
-[`mac/README.md`](mac/README.md).
+(HD20 disks, and FujiBus commands through the IWM), tested in Snow and on a
+real Mac booting from TNFS through the FujiNet Mac board. See
+[`mac/README.md`](mac/README.md) and [`mac/NIO-ARCH.md`](mac/NIO-ARCH.md).
 
 ---
 

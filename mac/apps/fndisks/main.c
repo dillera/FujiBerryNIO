@@ -27,9 +27,10 @@
 #include "fujinet-nio.h"
 #include "fn_raw.h"
 
-#ifndef START_DIR
-#define START_DIR "host:/mac/"
-#endif
+/* The first of these the FujiNet can list: POSIX NIO has "host", an ESP32
+ * has its internal flash and the SD card. */
+static const char *const roots[] = {"host:/mac/", "flash:/mac/", "sd0:/"};
+static const char *root = "host:/mac/";
 
 #define FILE_SERVICE 0xFE
 #define FILE_LIST 0x02
@@ -53,7 +54,7 @@ struct entry {
 static WindowPtr win;
 static struct entry entries[MAX_ENTRIES];
 static short n_entries, sel, top;
-static char dir[160] = START_DIR;
+static char dir[160];
 static char status_line[120];
 static fn_disk_info_t slot_info[SLOTS];
 static uint8_t slot_err[SLOTS];
@@ -95,7 +96,7 @@ static long double_click_ticks(void)
 static unsigned short le16(const uint8_t *p) { return (unsigned short)(p[0] | (p[1] << 8)); }
 
 /* FileService ListDirectory, compact and sorted, all pages. */
-static void load_dir(void)
+static uint8_t load_dir(void)
 {
     uint8_t req[200];
     size_t ulen = strlen(dir);
@@ -104,7 +105,7 @@ static void load_dir(void)
 
     n_entries = 0;
     sel = top = 0;
-    if (strcmp(dir, START_DIR) != 0) {
+    if (strcmp(dir, root) != 0) {
         strcpy(entries[0].name, "..");
         entries[0].is_dir = 1;
         n_entries = 1;
@@ -128,7 +129,7 @@ static void load_dir(void)
         r = fn_raw_call(FILE_SERVICE, FILE_LIST, req, (uint16_t)p, reply, sizeof(reply), &resp);
         if (r != FN_OK || resp.status != 0) {
             set_status("Cannot list %s (%s, status %u)", dir, fn_error_string(r), resp.status);
-            return;
+            return 0;
         }
         flags = reply[1];
         count = le16(reply + 6);
@@ -153,6 +154,7 @@ static void load_dir(void)
             break;
     }
     set_status("%d item(s) in %s", n_entries, dir);
+    return 1;
 }
 
 static void load_slots(void)
@@ -293,8 +295,15 @@ int main(void)
     if (r != FN_OK) {
         set_status("No FujiNet found: %s", fn_error_string(r));
     } else {
+        unsigned i;
+
         load_slots();
-        load_dir();
+        for (i = 0; i < sizeof(roots) / sizeof(roots[0]); ++i) {
+            root = roots[i];
+            strcpy(dir, root);
+            if (load_dir())
+                break;
+        }
     }
     draw();
 
@@ -336,7 +345,7 @@ int main(void)
                 ++sel;
             } else if (c == '\r') {
                 open_selected();
-            } else if (c == 8 && strcmp(dir, START_DIR) != 0) {
+            } else if (c == 8 && strcmp(dir, root) != 0) {
                 sel = 0;
                 open_selected();
             }

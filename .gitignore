@@ -12,3 +12,4 @@ tools/*/build/
 mac/run/
 mac/**/build/
 *.rom
+__pycache__/
