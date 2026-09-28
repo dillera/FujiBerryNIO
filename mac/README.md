@@ -168,6 +168,28 @@ unit 0 (the boot config mount). Stop NIO before changing an image on the
 host: NIO keeps it open, and the Mac would be served stale blocks and write
 a stale catalog back.
 
+## On the real FujiNet Mac board
+
+Patch 0006 also adds an ESP32 variant for the board (ESP32-WROVER-E,
+`boards/fujimac-rev0-8mb.json`). Its channel is UART2 to the Pico, at a
+fixed 2 Mbaud, RX GPIO33 and TX GPIO26 (from the firmware's `mac_rev0.h`).
+It serves the HD20s and the FujiBus mailbox, which need nothing new from the
+Pico. It does not offer the floppy: that still needs RMT track streaming and
+the `'w'` write-capture frames on the ESP32 side.
+
+```sh
+cd workspace/repos/fujinet-nio
+export PATH=$HOME/.platformio/penv/bin:$PATH
+yes y | ./build.sh -s mac-floppy-fujimac-rev0
+./build.sh -b          # compiles: RAM 13%, flash 90% of the 2 MB app partition
+```
+
+**Built, not yet run on hardware.** The protocol is the one the
+emulator runs against. Flashing it replaces the classic firmware on the
+ESP32 (the Pico stays as is), and there is no web UI. Mounts come from the
+config's boot mount, and then from the Mac itself, with FujiNet Disks.
+Protocol reference for NIO: `docs/mac_floppy_bus.md` (in patch 0006).
+
 ## Notes and limits
 
 * **HD20 size.** Keep images at or below 65,519 blocks (32 MB less the
@@ -189,8 +211,8 @@ a stale catalog back.
 
 ## Next
 
-* NIO on the FujiNet Mac board's ESP32 with the Pico UART as the channel,
-  plus RMT track streaming and `'w'` write-capture frames.
+* Try the `mac-floppy-fujimac-rev0` build on the real board. Then add RMT
+  track streaming and the `'w'` write-capture frames for its floppy.
 * DiskCopy 4.2 and MOOF floppies.
 * A fuller Mac CONFIG: TNFS hosts, the slot catalogue, and images by name
   in the slot list. FujiNet Disks is the first step.

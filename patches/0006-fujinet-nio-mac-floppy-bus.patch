@@ -77,6 +77,180 @@ index b431f2c..a0797de 100644
      {
        "name": "fujibus-tcp-release-build",
        "configurePreset": "fujibus-tcp-release"
+diff --git a/boards/fujimac-rev0-8mb.json b/boards/fujimac-rev0-8mb.json
+new file mode 100644
+index 0000000..845b825
+--- /dev/null
++++ b/boards/fujimac-rev0-8mb.json
+@@ -0,0 +1,47 @@
++{
++  "build": {
++    "arduino": {
++      "ldscript": "esp32_out.ld"
++    },
++    "core": "esp32",
++    "extra_flags": [
++      "-DARDUINO_ESP32_DEV",
++      "-DFN_PINMAP_DEFAULT=FN_PINMAP_MAC_REV0"
++    ],
++    "f_cpu": "240000000L",
++    "f_flash": "40000000L",
++    "flash_mode": "dio",
++    "mcu": "esp32",
++    "variant": "esp32",
++    "partitions": "pio-build/partitions/partitions_8MB.csv"
++  },
++  "connectivity": [
++    "wifi",
++    "can"
++  ],
++  "debug": {
++    "default_tool": "ftdi",
++    "onboard_tools": [
++      "ftdi"
++    ],
++    "openocd_board": "esp-wrover.cfg"
++  },
++  "frameworks": [
++    "espidf"
++  ],
++  "name": "FujiNet Mac 68k rev0 (ESP32-WROVER-E, 8MB)",
++  "upload": {
++    "flash_size": "8MB",
++    "maximum_ram_size": 327680,
++    "maximum_size": 8388608,
++    "protocols": [
++      "esptool",
++      "espota",
++      "ftdi"
++    ],
++    "require_upload_port": true,
++    "speed": 460800
++  },
++  "url": "https://github.com/FujiNetWIFI/fujinet-platformio",
++  "vendor": "FujiNet Project"
++}
+diff --git a/docs/README.md b/docs/README.md
+index 1098663..d3c3764 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -19,6 +19,7 @@ Principal evergreen documents include:
+ | `disk_device_protocol.md` | DiskDevice wire contract |
+ | `driver_architecture.md` | Client driver, session, and channel architecture |
+ | `amiga/amiga-floppy-channel.md` | Amiga floppy/Pico channel trade study |
++| `mac_floppy_bus.md` | Macintosh floppy port: HD20 (DCD), GCR floppy, FujiBus through the HD20 mailbox |
+ | `testing.md` | Test strategy and commands |
+ | `developer_onboarding.md` | Development environment and onboarding |
+ 
+diff --git a/docs/mac_floppy_bus.md b/docs/mac_floppy_bus.md
+new file mode 100644
+index 0000000..9a52428
+--- /dev/null
++++ b/docs/mac_floppy_bus.md
+@@ -0,0 +1,103 @@
++# Macintosh floppy-port bus
++
++fujinet-nio can serve a 68000 Macintosh through its floppy port, the way the
++FujiNet Mac 68k board does with the classic firmware:
++
++* **HD20 disks** (Directly Connected Disks, DCD);
++* the **800K GCR floppy**;
++* **FujiBus from Mac programs**, carried in HD20 block I/O. This is new: no
++  firmware had it before.
++
++Source: `MacFloppyFramer` (`include/fujinet/io/transport/mac_floppy_framer.h`),
++`mac_gcr.{h,cpp}` (the FujiNet Mac firmware's GCR codec, unchanged), tests in
++`tests/test_mac_floppy_framer.cpp`.
++
++## Where it sits
++
++On the FujiNet Mac board a Raspberry Pi Pico is wired to the Mac's DB-19
++floppy connector. It runs the drive side of the DCD and floppy protocols in
++PIO, and talks to the FujiNet MCU over a 2 Mbaud UART with a one-character
++protocol. `MacFloppyFramer` is the FujiNet side of that UART protocol. It
++plugs into the ordinary `FujiBusTransport` as an `IFramer`:
++
++```
++Mac --IWM/DB-19--> drive side (Pico, or an emulator) --UART / TCP--> MacFloppyFramer
++                                                      |-- HD20 blocks   -> DiskService slots 1-4
++                                                      |-- floppy        -> DiskService slot 5
++                                                      `-- mailbox       -> FujiBusTransport -> devices
++```
++
++| Build | Channel | Serves |
++| --- | --- | --- |
++| `mac-floppy-tcp-debug` (POSIX preset) | TCP server (`channel.tcp_port`) | HD20, floppy, FujiBus: for emulators such as Snow |
++| `mac-floppy-fujimac-rev0` (ESP32-WROVER board) | UART2, 2 Mbaud, to the Pico | HD20 and FujiBus. The floppy waits for RMT track streaming |
++
++Slots use the FujiBus DiskService numbering. Slots 1-4 are DCD units 0-3 (the
++chain is the contiguous run of mounted slots from 1). Slot 5 is the floppy:
++a 400K or 800K sector image.
++
++## Drive side <-> FujiNet
++
++| From the drive side | Reply | |
++| --- | --- | --- |
++| `A`..`D` | none | select DCD unit 0..3 |
++| `R` b2 b1 b0 | 512 bytes | read block (24-bit, big endian) |
++| `W` b2 b1 b0 + 512 bytes | `w` / `e` | write block |
++| `T` | 336 bytes | HD20 status block (payload offsets 6..341) |
++| `0` / `4` | none | floppy step direction: in / out |
++| `1` | track \| 0x80, or `N` | floppy step |
++| `2` / `6` | `M` / `F` | floppy motor on / off |
++| `7` | `E` | the Mac ejected the floppy (the slot is unmounted and forgotten) |
++| `?` | `h` n (see `!`) | how many DCD units (fujinet-nio) |
++| `#` cyl side | nbits (u32 BE), bits | one GCR track, MSB first (emulators) |
++| `P` cyl side nbits bits | `p` n | a whole written track; changed sectors are written (emulators) |
++| `!` | none | polled mode (emulators) |
++
++Unsolicited, from the FujiNet: `h` n (DCD units), `s`/`d` t (400K/800K
++floppy in, head at t\|0x80), `u`/`l` (writable/locked), `r` (floppy
++removed).
++
++**Polled mode.** An unsolicited byte can land in front of a reply the drive
++side is already waiting for. The Pico avoids this by draining its UART before
++each command. An emulator on a socket sends `!` instead: after that NIO
++sends nothing unasked, and `?` answers `h` n f. Here f is the floppy: 0
++none, 1 400K, 2 800K, plus 0x80 if it is write protected.
++
++**The floppy.** On the board the ESP32 streams encoded tracks from its RMT
++peripheral, and receives the Mac's writes as captured WR bitstreams. The
++emulator commands replace those wires. `#` returns a track encoded from the
++sector image. `P` takes a track as the Mac left it. NIO searches it for
++address and data fields at every bit offset, twice around the track so a
++field written across the index is found too. It writes each good sector that
++differs from the image.
++
++## FujiBus through the mailbox
++
++Every HD20 unit reports 16 more blocks than its image holds. Those blocks
++never reach the image.
++
++* A **write** starting at the first of them carries one raw (un-SLIPped)
++  FujiBus packet.
++* **Reading** them returns the response.
++
++```
++block 0, bytes 0..15:  "FNIO"  version=1  state  seq (u16 BE)  length (u32 BE)  reserved (4)
++bytes 16..             the packet, continuing into blocks 1..15 (8176 bytes max)
++state:                 0 idle, 1 response ready, 2 request pending
++```
++
++The request's seq comes back with the response. A client polls block 0 until
++the state is 1 and the seq matches, then reads any further blocks.
++
++The Mac needs no driver, INIT or patch. It finds the mailbox by walking the
++drive queue and reading the block at `drive size - 16` for `FNIO`. It then
++uses driver-level `PBWrite`/`PBRead` on the ROM's `.Sony` driver, which
++handles HD20s on a 512Ke, Plus, SE and later. The board's Pico sees only
++ordinary block reads and writes. fujinet-nio-lib's `mac68k` target implements
++this (`src/platform/mac68k/fn_transport.c`), so Mac programs use the usual
++`fn_*` API.
++
++Limits:
++* HD20 images must stay at or below 65,519 blocks (32 MB less the mailbox);
++  the Mac rejects HD20s over 65,535 blocks.
++* A response larger than the mailbox is dropped.
 diff --git a/include/fujinet/build/profile.h b/include/fujinet/build/profile.h
 index b645df3..9ff7a4b 100644
 --- a/include/fujinet/build/profile.h
@@ -247,10 +421,10 @@ index 0e62505..eb495df 100644
      const disk::DiskService& disk_service() const { return _svc; }
 diff --git a/include/fujinet/io/transport/mac_floppy_framer.h b/include/fujinet/io/transport/mac_floppy_framer.h
 new file mode 100644
-index 0000000..0f27920
+index 0000000..d63cdac
 --- /dev/null
 +++ b/include/fujinet/io/transport/mac_floppy_framer.h
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,150 @@
 +#pragma once
 +
 +#include "fujinet/io/transport/iframer.h"
@@ -340,8 +514,12 @@ index 0000000..0f27920
 +
 +    // onEject: the Mac ejected the medium in a slot. Defaults to a plain
 +    // unmount; the disk device also forgets it so it is not restored.
++    // serveFloppy: offer the floppy slot at all. Only a drive side that can
++    // take tracks through '#'/'P' (an emulator) can use it until the ESP32
++    // side streams tracks to the board's floppy wires.
 +    explicit MacFloppyFramer(disk::DiskService& disks,
-+                             std::function<void(std::size_t)> onEject = {});
++                             std::function<void(std::size_t)> onEject = {},
++                             bool serveFloppy = true);
 +
 +    void poll(Channel& ch) override;
 +    bool nextPacket(ByteBuffer& outPacket) override;
@@ -391,11 +569,50 @@ index 0000000..0f27920
 +    // Floppy: what the drive side has been told, and the head position.
 +    int _floppyAnnounced{0};                  // sides announced, 0 = none
 +    bool _polled{false};                      // '!': answer '?' only
++    bool _serveFloppy{true};
 +    int _head{0};
 +    int _stepDir{1};
 +};
 +
 +} // namespace fujinet::io
+diff --git a/pio-build/ini/platforms/platformio-mac-floppy-fujimac-rev0.ini b/pio-build/ini/platforms/platformio-mac-floppy-fujimac-rev0.ini
+new file mode 100644
+index 0000000..4f28d07
+--- /dev/null
++++ b/pio-build/ini/platforms/platformio-mac-floppy-fujimac-rev0.ini
+@@ -0,0 +1,20 @@
++[fujinet]
++build_board    = mac-floppy-fujimac-rev0
++
++[env]
++upload_port = /dev/ttyUSB0
++monitor_port = /dev/ttyUSB0
++
++; FujiNet Mac 68k board (ESP32-WROVER-E + Pico on the floppy port): NIO serves
++; the Pico's HD20 (DCD) blocks and FujiBus through the HD20 mailbox over the
++; board's 2 Mbaud UART. No floppy yet: that needs RMT track streaming.
++[env:mac-floppy-fujimac-rev0]
++platform = espressif32@${fujinet.esp32_platform_version}
++platform_packages = ${fujinet.esp32_platform_packages}
++board = fujimac-rev0-8mb
++build_type = debug
++build_flags =
++    ${env.build_flags}
++    -DFN_BUILD_ESP32_MAC_FLOPPY
++    -DFN_PLATFORM_ESP32
++board_build.cmake_extra_args = -D CONFIG_IDF_TARGET_ESP32=1
+diff --git a/pio-build/sdkconfig/00_platform_sdkconfig_map.txt b/pio-build/sdkconfig/00_platform_sdkconfig_map.txt
+index 7827a3b..aade33f 100644
+--- a/pio-build/sdkconfig/00_platform_sdkconfig_map.txt
++++ b/pio-build/sdkconfig/00_platform_sdkconfig_map.txt
+@@ -12,6 +12,7 @@ atari-nio-fujibus-sio-gpio-fujinet-v1-8mb=common,wifi,fatfs,fs-littlefs,fujibus-
+ fujibus-gpio-rs232-cdc-log-s3-wroom-1-n16r8=common,wifi,fatfs,fs-littlefs,spiram-oct80,fujibus-gpio,log-cdc,cli-cdc
+ fujibus-gpio-rs232-uart-log-s3-wroom-1-n16r8=common,wifi,fatfs,fs-littlefs,spiram-oct80,fujibus-gpio,log-uart,cli-uart
+ fujibus-gpio-rs232-uart-log-rev0=common,wifi,fatfs,fs-littlefs,fujibus-gpio,log-uart,cli-uart
++mac-floppy-fujimac-rev0=common,wifi,fatfs,fs-littlefs,fujibus-gpio,log-uart,cli-uart
+ 
+ 
+ #################################################################
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 5342d61..712de18 100644
 --- a/src/CMakeLists.txt
@@ -410,7 +627,7 @@ index 5342d61..712de18 100644
          lib/transport/legacy/iwm_traits.cpp
          lib/transport/legacy/iwm_transport.cpp
 diff --git a/src/lib/bootstrap.cpp b/src/lib/bootstrap.cpp
-index befb86d..2922bb8 100644
+index befb86d..d0a3308 100644
 --- a/src/lib/bootstrap.cpp
 +++ b/src/lib/bootstrap.cpp
 @@ -3,6 +3,12 @@
@@ -426,7 +643,7 @@ index befb86d..2922bb8 100644
  #include "fujinet/config/fuji_config.h"
  // #include "fujinet/io/transport/iec_transport.h"
  // etc.
-@@ -79,6 +85,28 @@ io::ITransport* setup_transports(FujinetCore& core,
+@@ -79,6 +85,32 @@ io::ITransport* setup_transports(FujinetCore& core,
          // ...
          break;
      }
@@ -438,14 +655,18 @@ index befb86d..2922bb8 100644
 +        // slots so FujiBus still works.
 +        auto* disk = dynamic_cast<io::DiskDevice*>(core.deviceManager().getDevice(
 +            io::protocol::to_device_id(io::protocol::WireDeviceId::DiskService)));
++        // The floppy needs track streaming: only an emulator link (TCP)
++        // has it so far.
++        const bool serveFloppy = profile.primaryChannel == build::ChannelKind::TcpSocket;
 +        io::MacFloppyFramer* framer = nullptr;
 +        if (disk) {
 +            framer = new io::MacFloppyFramer(
-+                disk->disk_service(), [disk](std::size_t slot) { disk->eject(slot); });
++                disk->disk_service(), [disk](std::size_t slot) { disk->eject(slot); },
++                serveFloppy);
 +        } else {
 +            FN_LOGW("bootstrap", "Mac floppy bus: no disk device registered, no disks served");
 +            auto* disks = new disk::DiskService(core.storageManager(), disk::make_default_image_registry());
-+            framer = new io::MacFloppyFramer(*disks);
++            framer = new io::MacFloppyFramer(*disks, {}, serveFloppy);
 +        }
 +        auto* t = new io::FujiBusTransport(channel, *framer);
 +        core.addTransport(t);
@@ -987,10 +1208,10 @@ index 88d9c0a..450f2c5 100644
      if (slotIndex >= _runtimeMounts.size()) return;
 diff --git a/src/lib/transport/mac_floppy_framer.cpp b/src/lib/transport/mac_floppy_framer.cpp
 new file mode 100644
-index 0000000..f055670
+index 0000000..9b61e5c
 --- /dev/null
 +++ b/src/lib/transport/mac_floppy_framer.cpp
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,593 @@
 +#include "fujinet/io/transport/mac_floppy_framer.h"
 +
 +#include "fujinet/core/logging.h"
@@ -1053,9 +1274,11 @@ index 0000000..f055670
 +} // namespace
 +
 +MacFloppyFramer::MacFloppyFramer(disk::DiskService& disks,
-+                                 std::function<void(std::size_t)> onEject)
++                                 std::function<void(std::size_t)> onEject,
++                                 bool serveFloppy)
 +    : _disks(disks)
 +    , _onEject(std::move(onEject))
++    , _serveFloppy(serveFloppy)
 +{
 +}
 +
@@ -1267,6 +1490,9 @@ index 0000000..f055670
 +
 +int MacFloppyFramer::floppy_sides()
 +{
++    if (!_serveFloppy) {
++        return 0;
++    }
 +    const disk::DiskSlotInfo info = _disks.info(FLOPPY_SLOT);
 +    if (!info.inserted) {
 +        return 0;
@@ -1579,6 +1805,95 @@ index 0000000..f055670
 +}
 +
 +} // namespace fujinet::io
+diff --git a/src/platform/esp32/build_profile.cpp b/src/platform/esp32/build_profile.cpp
+index 5d7a057..40a2544 100644
+--- a/src/platform/esp32/build_profile.cpp
++++ b/src/platform/esp32/build_profile.cpp
+@@ -43,6 +43,14 @@ BuildProfile current_build_profile()
+         .name             = "S3 + FujiBus over GPIO (e.g. RS232)",
+         .hw               = {},
+     };
++#elif defined(FN_BUILD_ESP32_MAC_FLOPPY)
++    profile = BuildProfile{
++        .machine          = Machine::Mac68k,
++        .primaryTransport = TransportKind::MacFloppy,
++        .primaryChannel   = ChannelKind::UartGpio,
++        .name             = "Mac 68k board: floppy-port bus to the Pico over UART",
++        .hw               = {},
++    };
+ #else
+     // Default ESP32 fallback
+     profile = BuildProfile{
+diff --git a/src/platform/esp32/channel_factory.cpp b/src/platform/esp32/channel_factory.cpp
+index 206e083..5d9a4fb 100644
+--- a/src/platform/esp32/channel_factory.cpp
++++ b/src/platform/esp32/channel_factory.cpp
+@@ -51,11 +51,16 @@ create_channel_for_profile(const build::BuildProfile& profile, const config::Fuj
+         FN_LOGE(TAG, "UdpSocket channel kind not supported on ESP32");
+         return nullptr;
+ 
+-    case ChannelKind::UartGpio:
++    case ChannelKind::UartGpio: {
++        auto uart = config.channel.uart;
++        if (profile.primaryTransport == build::TransportKind::MacFloppy) {
++            // The Mac board's Pico link runs at a fixed 2 Mbaud.
++            uart.baudRate = 2000000;
++        }
+         FN_ELOG("Using UartChannel for UartGpio (baud=%u, data_bits=%d)",
+-                static_cast<unsigned>(config.channel.uart.baudRate),
+-                config.channel.uart.dataBits);
+-        return std::make_unique<esp32::UartChannel>(config.channel.uart);
++                static_cast<unsigned>(uart.baudRate), uart.dataBits);
++        return std::make_unique<esp32::UartChannel>(uart);
++    }
+ 
+     case ChannelKind::SioGpio:
+ #if defined(FN_BUILD_ATARI_FUJIBUS_SIO)
+diff --git a/src/platform/esp32/pinmap.cpp b/src/platform/esp32/pinmap.cpp
+index 46fecdf..6108f1c 100644
+--- a/src/platform/esp32/pinmap.cpp
++++ b/src/platform/esp32/pinmap.cpp
+@@ -10,6 +10,7 @@ namespace fujinet::platform::esp32 {
+ #define FN_PINMAP_ATARIV1           4
+ #define FN_PINMAP_RS232             5
+ #define FN_PINMAP_RS232_REV0        6
++#define FN_PINMAP_MAC_REV0          7
+ // Add more here as they are used. These ensure we don't get weird macro expansions.
+ 
+ // Ensure at least one of FN_PINMAP or FN_PINMAP_DEFAULT is defined
+@@ -117,6 +118,32 @@ static constexpr PinMap BOARD_PINMAP{
+     },
+ };
+ 
++#elif FN_PINMAP == FN_PINMAP_MAC_REV0
++// FujiNet Mac 68k board ("fujimac-rev0"): ESP32-WROVER-E beside a Raspberry
++// Pi Pico on the Mac's floppy port. From fujinet-firmware mac_rev0.h,
++// a2_rev0.h and common.h. The primary UART is the 2 Mbaud link to the Pico.
++static constexpr PinMap BOARD_PINMAP{
++    .sd = SdSpiPins{
++        .mosi    = 23,  // GPIO_NUM_23 (PIN_SD_HOST_MOSI)
++        .miso    = 19,  // GPIO_NUM_19 (PIN_SD_HOST_MISO)
++        .sck     = 18,  // GPIO_NUM_18 (PIN_SD_HOST_SCK)
++        .cs      =  5,  // GPIO_NUM_5  (PIN_SD_HOST_CS)
++    },
++    .sio = {},
++    .rs232 = Rs232Pins{
++        .uart = UartPins{ .rx = 33, .tx = 26 },  // UART2 to the Pico (PIN_UART2_RX/TX)
++    },
++    .led = LedPins{
++        .wifi    =  2,  // GPIO_NUM_2  (PIN_LED_WIFI)
++        .bus     = 12,  // GPIO_NUM_12 (PIN_LED_BUS)
++    },
++    .button = ButtonPins{
++        .a       = 0,   // GPIO_NUM_0 (PIN_BUTTON_A)
++        .b       = -1,
++        .c       = -1,  // GPIO 14 is claimed by the floppy side on this board
++    },
++};
++
+ #else
+ #  error "Invalid FN_PINMAP value"
+ #endif
 diff --git a/tests/test_mac_floppy_framer.cpp b/tests/test_mac_floppy_framer.cpp
 new file mode 100644
 index 0000000..f48ba0e
