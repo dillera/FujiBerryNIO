@@ -29,8 +29,8 @@ run 1
 key 1f cmd
 run 15
 shot e2e-2-volume.png
-# FujiNetProbe, first icon in the window
-move 128 145
+# FujiNetProbe, second icon in the window (FujiNetDisks is first)
+move 193 145
 run 0.5
 click
 run 1

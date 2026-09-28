@@ -1,0 +1,231 @@
+From 13283665ac252f3c3f16a12156f9834eb9bbbf62 Mon Sep 17 00:00:00 2001
+From: Andrew Diller <dillera@dillernet.com>
+Date: Sun, 27 Sep 2026 22:50:41 -0400
+Subject: [PATCH 3/3] FujiNet link: polled mode, so announcements never meet a
+ reply
+
+Unsolicited floppy announcements from the FujiNet could land in front of
+a reply Snow was already waiting for and desync the link. Snow now asks
+for polled mode ('!') and queries '?' (units and floppy state) from its
+housekeeping instead; floppy changes become events as before. Every
+command drains stray bytes first as a safety net.
+
+Also: the HD20 driver's Q7H read while the DCD chain is selected is
+expected, so it no longer logs a warning.
+---
+ core/src/mac/swim/dcd.rs | 87 ++++++++++++++++++++++++----------------
+ core/src/mac/swim/iwm.rs |  5 +++
+ 2 files changed, 58 insertions(+), 34 deletions(-)
+
+diff --git a/core/src/mac/swim/dcd.rs b/core/src/mac/swim/dcd.rs
+index fb4746b..3a0df75 100644
+--- a/core/src/mac/swim/dcd.rs
++++ b/core/src/mac/swim/dcd.rs
+@@ -50,12 +50,11 @@ impl Link {
+         self.stream.read_exact(buf)
+     }
+ 
+-    /// Consumes unsolicited announcements: 'h' n (DCD units) and the floppy
+-    /// ones ('s'/'d' t, 'u'/'l', 'r'). Returns the latest unit count.
+-    fn drain(&mut self, floppy: &mut VecDeque<FloppyEvent>) -> std::io::Result<Option<usize>> {
+-        let mut units = None;
++    /// Discards anything unexpected waiting on the link. In polled mode
++    /// the FujiNet sends nothing unasked, so this is only a safety net.
++    fn drain(&mut self) -> std::io::Result<()> {
+         self.stream.set_nonblocking(true)?;
+-        let mut b = [0u8; 1];
++        let mut b = [0u8; 64];
+         let result = loop {
+             match self.stream.read(&mut b) {
+                 Ok(0) => {
+@@ -64,24 +63,8 @@ impl Link {
+                         "FujiNet closed the link",
+                     ));
+                 }
+-                Ok(_) if matches!(b[0], b'h' | b's' | b'd') => {
+-                    self.stream.set_nonblocking(false)?;
+-                    let mut n = [0u8; 1];
+-                    self.stream.read_exact(&mut n)?;
+-                    match b[0] {
+-                        b'h' => units = Some(n[0] as usize),
+-                        c => floppy.push_back(FloppyEvent::Inserted {
+-                            sides: if c == b'd' { 2 } else { 1 },
+-                        }),
+-                    }
+-                    self.stream.set_nonblocking(true)?;
+-                }
+-                Ok(_) if b[0] == b'u' || b[0] == b'l' => {
+-                    floppy.push_back(FloppyEvent::Writable(b[0] == b'u'))
+-                }
+-                Ok(_) if b[0] == b'r' => floppy.push_back(FloppyEvent::Removed),
+-                Ok(_) => warn!("DCD: unexpected byte {:02X} from FujiNet", b[0]),
+-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break Ok(units),
++                Ok(n) => warn!("DCD: discarding {} unexpected byte(s) from FujiNet", n),
++                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break Ok(()),
+                 Err(e) => break Err(e),
+             }
+         };
+@@ -89,18 +72,26 @@ impl Link {
+         result
+     }
+ 
+-    fn query_units(&mut self, floppy: &mut VecDeque<FloppyEvent>) -> std::io::Result<usize> {
+-        self.drain(floppy)?;
++    /// Polled mode: the FujiNet sends nothing unasked, so an announcement
++    /// can never land in front of a reply.
++    fn set_polled(&mut self) -> std::io::Result<()> {
++        self.stream.write_all(b"!")
++    }
++
++    /// (DCD units, floppy state: 0 none, 1 400K, 2 800K, | 0x80 locked)
++    fn query(&mut self) -> std::io::Result<(usize, u8)> {
++        self.drain()?;
+         self.stream.write_all(b"?")?;
+-        let mut r = [0u8; 2];
++        let mut r = [0u8; 3];
+         self.read_exact(&mut r)?;
+         if r[0] != b'h' {
+             return Err(std::io::Error::other("bad reply to unit query"));
+         }
+-        Ok(r[1] as usize)
++        Ok((r[1] as usize, r[2]))
+     }
+ 
+     fn select(&mut self, unit: usize) -> std::io::Result<()> {
++        self.drain()?;
+         self.stream.write_all(&[b'A' + unit as u8])
+     }
+ 
+@@ -125,6 +116,7 @@ impl Link {
+ 
+     /// A floppy command byte ('7' eject ...); returns the reply byte.
+     fn floppy_command(&mut self, c: u8) -> std::io::Result<u8> {
++        self.drain()?;
+         self.stream.write_all(&[c])?;
+         let mut r = [0u8; 1];
+         self.read_exact(&mut r)?;
+@@ -133,6 +125,7 @@ impl Link {
+ 
+     /// One GCR track, encoded by the FujiNet: (bytes, bits).
+     fn track(&mut self, cyl: usize, side: usize) -> std::io::Result<(Vec<u8>, usize)> {
++        self.drain()?;
+         self.stream.write_all(&[b'#', cyl as u8, side as u8])?;
+         let mut len = [0u8; 4];
+         self.read_exact(&mut len)?;
+@@ -144,6 +137,7 @@ impl Link {
+ 
+     /// Sends a track back; returns how many sectors the FujiNet wrote.
+     fn put_track(&mut self, cyl: usize, side: usize, data: &[u8], bits: usize) -> std::io::Result<u8> {
++        self.drain()?;
+         let mut msg = vec![b'P', cyl as u8, side as u8];
+         msg.extend_from_slice(&(bits as u32).to_be_bytes());
+         msg.extend_from_slice(&data[..bits.div_ceil(8)]);
+@@ -207,8 +201,10 @@ pub struct DcdChain {
+     /// Position in the daisy chain; `units` means the chain has passed on
+     /// to the floppy drive behind it.
+     pub pos: usize,
+-    /// Floppy announcements not yet applied.
++    /// Floppy changes not yet applied.
+     pub floppy_events: VecDeque<FloppyEvent>,
++    /// The floppy state the FujiNet last reported (see `Link::query`).
++    floppy_state: u8,
+     phase: u8,
+     hshk: bool,
+     xfer: Xfer,
+@@ -248,6 +244,7 @@ impl DcdChain {
+             units: 0,
+             pos: 0,
+             floppy_events: VecDeque::new(),
++            floppy_state: 0,
+             phase: 2,
+             hshk: false,
+             xfer: Xfer::Idle,
+@@ -282,11 +279,16 @@ impl DcdChain {
+             return;
+         };
+         self.last_connect = Some(Instant::now());
+-        let events = &mut self.floppy_events;
+-        match Link::connect(&addr).and_then(|mut l| l.query_units(events).map(|n| (l, n))) {
+-            Ok((link, n)) => {
++        let linked = Link::connect(&addr).and_then(|mut l| {
++            l.set_polled()?;
++            l.query().map(|q| (l, q))
++        });
++        match linked {
++            Ok((link, (n, floppy))) => {
+                 self.units = n.min(MAX_UNITS);
+                 self.link = Some(link);
++                self.floppy_state = 0;
++                self.note_floppy(floppy);
+                 info!("DCD: FujiNet at {} reports {} unit(s)", addr, self.units);
+             }
+             Err(e) => {
+@@ -312,15 +314,15 @@ impl DcdChain {
+             return;
+         }
+         match self.link.as_mut() {
+-            Some(link) => match link.drain(&mut self.floppy_events) {
+-                Ok(Some(n)) => {
++            Some(link) => match link.query() {
++                Ok((n, floppy)) => {
+                     let n = n.min(MAX_UNITS);
+                     if n != self.units {
+                         info!("DCD: {} unit(s) now in the chain", n);
+                         self.units = n;
+                     }
++                    self.note_floppy(floppy);
+                 }
+-                Ok(None) => (),
+                 Err(e) => self.drop_link(e),
+             },
+             None => {
+@@ -334,6 +336,22 @@ impl DcdChain {
+         }
+     }
+ 
++    /// Turns a change in the FujiNet's floppy state into events.
++    fn note_floppy(&mut self, state: u8) {
++        if state == self.floppy_state {
++            return;
++        }
++        let sides = (state & 0x03) as usize;
++        if self.floppy_state & 0x03 != 0 {
++            self.floppy_events.push_back(FloppyEvent::Removed);
++        }
++        if sides != 0 {
++            self.floppy_events.push_back(FloppyEvent::Inserted { sides });
++            self.floppy_events.push_back(FloppyEvent::Writable(state & 0x80 == 0));
++        }
++        self.floppy_state = state;
++    }
++
+     /// Fetches every track of the FujiNet's floppy, GCR encoded by it:
+     /// `[cylinder][side]`.
+     pub fn floppy_tracks(&mut self, sides: usize) -> Option<Vec<[Option<(Vec<u8>, usize)>; 2]>> {
+@@ -375,6 +393,7 @@ impl DcdChain {
+         {
+             self.drop_link(e);
+         }
++        self.floppy_state = 0;
+     }
+ 
+     /// The RD line as seen through the IWM sense bit.
+diff --git a/core/src/mac/swim/iwm.rs b/core/src/mac/swim/iwm.rs
+index d098b9f..9e614d2 100644
+--- a/core/src/mac/swim/iwm.rs
++++ b/core/src/mac/swim/iwm.rs
+@@ -188,6 +188,11 @@ impl Swim {
+                 result.set_ready(self.write_buffer.is_none());
+                 result.0
+             }
++            _ if self.dcd_selected() => {
++                // The HD20 driver touches Q7H with a read to enter write
++                // mode; the value is not used.
++                0
++            }
+             _ => {
+                 warn!("IWM unknown read q6 = {:?} q7 = {:?}", self.q6, self.q7);
+                 0
+-- 
+2.51.0
+

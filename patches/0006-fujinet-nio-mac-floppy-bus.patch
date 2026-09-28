@@ -247,10 +247,10 @@ index 0e62505..eb495df 100644
      const disk::DiskService& disk_service() const { return _svc; }
 diff --git a/include/fujinet/io/transport/mac_floppy_framer.h b/include/fujinet/io/transport/mac_floppy_framer.h
 new file mode 100644
-index 0000000..f092460
+index 0000000..0f27920
 --- /dev/null
 +++ b/include/fujinet/io/transport/mac_floppy_framer.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,145 @@
 +#pragma once
 +
 +#include "fujinet/io/transport/iframer.h"
@@ -308,6 +308,15 @@ index 0000000..f092460
 +//     'P' cyl side nbits(u32 BE) <bits>
 +//                                 a whole track as the Mac left it; the sectors
 +//                                 are decoded and written   -> 'p' n (written)
++//     '!'                        polled mode: from now on nothing is sent
++//                                 unasked, and '?' answers 'h' n f, where f is
++//                                 the floppy: 0 none, 1 400K, 2 800K, | 0x80 if
++//                                 write protected
++//
++// Unsolicited bytes can land in front of a reply the drive side is already
++// waiting for; the board's Pico drains its UART before each command and
++// polls between them. An emulator talks to NIO over a socket with no such
++// rhythm, so it asks for polled mode instead.
 +//
 +// FujiBus over the floppy port. Every DCD unit reports MAILBOX_BLOCKS more
 +// blocks than its image holds. Those blocks never reach the image: a write
@@ -381,6 +390,7 @@ index 0000000..f092460
 +
 +    // Floppy: what the drive side has been told, and the head position.
 +    int _floppyAnnounced{0};                  // sides announced, 0 = none
++    bool _polled{false};                      // '!': answer '?' only
 +    int _head{0};
 +    int _stepDir{1};
 +};
@@ -977,10 +987,10 @@ index 88d9c0a..450f2c5 100644
      if (slotIndex >= _runtimeMounts.size()) return;
 diff --git a/src/lib/transport/mac_floppy_framer.cpp b/src/lib/transport/mac_floppy_framer.cpp
 new file mode 100644
-index 0000000..9b1c314
+index 0000000..f055670
 --- /dev/null
 +++ b/src/lib/transport/mac_floppy_framer.cpp
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,588 @@
 +#include "fujinet/io/transport/mac_floppy_framer.h"
 +
 +#include "fujinet/core/logging.h"
@@ -1063,8 +1073,10 @@ index 0000000..9b1c314
 +    while (!_rx.empty() && handle_command(ch)) {
 +    }
 +
-+    announce_units(ch, false);
-+    announce_floppy(ch);
++    if (!_polled) {
++        announce_units(ch, false);
++        announce_floppy(ch);
++    }
 +}
 +
 +bool MacFloppyFramer::nextPacket(ByteBuffer& outPacket)
@@ -1101,9 +1113,22 @@ index 0000000..9b1c314
 +    }
 +
 +    switch (c) {
-+    case '?':
-+        // A drive side (re)connecting: tell it everything afresh.
++    case '!':
 +        _rx.pop_front();
++        _polled = true;
++        return true;
++
++    case '?':
++        _rx.pop_front();
++        if (_polled) {
++            const int sides = floppy_sides();
++            const bool ro = sides && _disks.info(FLOPPY_SLOT).readOnly;
++            const std::uint8_t reply[3] = {'h', std::uint8_t(count_units()),
++                                           std::uint8_t(sides | (ro ? 0x80 : 0))};
++            ch.write(reply, sizeof(reply));
++            return true;
++        }
++        // A drive side (re)connecting: tell it everything afresh.
 +        _floppyAnnounced = 0;
 +        announce_units(ch, true);
 +        return true;
@@ -1556,10 +1581,10 @@ index 0000000..9b1c314
 +} // namespace fujinet::io
 diff --git a/tests/test_mac_floppy_framer.cpp b/tests/test_mac_floppy_framer.cpp
 new file mode 100644
-index 0000000..6b5cf64
+index 0000000..f48ba0e
 --- /dev/null
 +++ b/tests/test_mac_floppy_framer.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,238 @@
 +#include "doctest.h"
 +
 +#include "fake_fs.h"
@@ -1782,4 +1807,19 @@ index 0000000..6b5cf64
 +    CHECK(rig.exchange({'7'}) == std::vector<std::uint8_t>{'E'});
 +    CHECK_FALSE(rig.disks->info(MacFloppyFramer::FLOPPY_SLOT).inserted);
 +    CHECK(rig.exchange({'1'}) == std::vector<std::uint8_t>{'N'});
++}
++
++TEST_CASE("MacFloppyFramer: polled mode sends nothing unasked")
++{
++    Rig rig;
++    CHECK(rig.exchange({'!', '?'}) == std::vector<std::uint8_t>{'h', 1, 0});
++
++    // A floppy arrives: no announcement until the drive side asks.
++    REQUIRE(rig.disks->mount(MacFloppyFramer::FLOPPY_SLOT, "mem", "/fl.dsk", {}).ok());
++    CHECK(rig.read_block(0).size() == 512);
++    CHECK(rig.exchange({'?'}) == std::vector<std::uint8_t>{'h', 1, 2});
++
++    REQUIRE(rig.disks->unmount(0).ok());
++    CHECK(rig.exchange({}).empty());
++    CHECK(rig.exchange({'?'}) == std::vector<std::uint8_t>{'h', 0, 2});
 +}

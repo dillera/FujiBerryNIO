@@ -1,7 +1,7 @@
 From 100aabba29e8f768a13cff6f5db0168916f2173c Mon Sep 17 00:00:00 2001
 From: Andrew Diller <dillera@dillernet.com>
 Date: Sun, 27 Sep 2026 22:35:42 -0400
-Subject: [PATCH 2/2] FujiNet floppy in the external drive, GCR tracks from the
+Subject: [PATCH 2/3] FujiNet floppy in the external drive, GCR tracks from the
  FujiNet
 
 The FujiNet announces its floppy slot on the same link as the DCD chain

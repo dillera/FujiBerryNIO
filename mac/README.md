@@ -29,12 +29,19 @@ Verified in the Snow emulator, as a Mac Plus (ROM v3) running System 6.0.8:
   firmware does.
 * **A Mac Plus with no floppy boots System 6.0.8 from NIO's HD20**
   (`BOOT_FROM=run/boot608.dsk tools/make-fujinet-volume.sh`).
+* **FujiNet Disks**, a Mac app, is a small CONFIG over the floppy port. It
+  browses NIO's `host:/mac/` through the FileService and shows the five
+  slots. It mounts the selected image with 1-5 and ejects with Command-1..5.
+  A floppy mounted in slot 5 is in the external drive at once; the HD20
+  slots take effect when the Mac restarts, since the ROM looks for HD20s
+  only at startup.
+
+![FujiNet Disks](evidence/fujinet-disks-mount.png)
 
 NIO unit tests (`tests/test_mac_floppy_framer.cpp`, in patch 0006) cover:
-DCD status and block I/O, a two-block mailbox exchange, and floppy tracks
+DCD status and block I/O, a two-block mailbox exchange, floppy tracks
 (encode, round trip, a rewritten sector decoded into the image, step,
-motor, eject). The full suite passes: 386 of 386, in both the
-`mac-floppy-tcp-debug` and `fujibus-tcp-debug` builds.
+motor, eject), and polled mode. The full suite passes: 387 of 387.
 
 ![FujiNetProbe on a Mac Plus](evidence/probe-clock-http.png)
 
@@ -76,6 +83,12 @@ extra commands:
 Snow asks for all 160 tracks when a disk is inserted, and on motor-off sends
 back only the tracks the Mac changed.
 
+**Polled mode (`!`).** NIO's announcements are unsolicited, so one can land
+in front of a reply the drive side is already waiting for. The board's Pico
+avoids that by draining its UART before each command. An emulator on a
+socket instead sends `!`: NIO then sends nothing unasked, and `?` answers
+`h` n f (DCD units, floppy state). Snow polls `?` every 100 ms.
+
 The drive side of the link is exactly what the Pico on the FujiNet Mac board
 already speaks to the ESP32 (`fujinet-firmware lib/bus/mac/mac.h`). So the
 same NIO framer should serve the real board, unchanged, once NIO runs on its
@@ -112,8 +125,9 @@ the volume needs neither.
 | --- | --- |
 | `patches/0006-fujinet-nio-mac-floppy-bus.patch` | NIO: `MacFloppyFramer`, profile `Mac68k`/`MacFloppy`, preset `mac-floppy-tcp-debug`, `.hda/.hfv/.dsk` as 512-byte-block images |
 | `patches/0007-fujinet-nio-lib-mac68k.patch` | fujinet-nio-lib: `mac68k` target (Retro68), `src/platform/mac68k/fn_transport.c` |
-| `mac/snow/*.patch` | Snow, also committed on branch `fujinet-dcd` of `~/code/snow`: (1) the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner; (2) the FujiNet floppy in the external drive |
+| `mac/snow/*.patch` | Snow, also committed on branch `fujinet-dcd` of `~/code/snow`: (1) the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner; (2) the FujiNet floppy in the external drive; (3) polled mode on the link |
 | `mac/apps/fnprobe` | FujiNetProbe: clock, HTTP GET and a floppy mount through fujinet-nio-lib; a 56 KB Toolbox app |
+| `mac/apps/fndisks` | FujiNet Disks: browse images on NIO, mount into slots 1-5, eject; a 55 KB Toolbox app |
 | `mac/tools/run-nio.sh` | Run NIO's Mac bus on `127.0.0.1:65510` (config in `run/fujinet-data/fujinet.yaml`) |
 | `mac/tools/run-snow.sh` | Snow GUI as a Mac Plus with the DCD chain (`SNOW_FUJINET_DCD`) |
 | `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume and the `NIO Floppy` 800K image, with the apps (NIO stopped); `BOOT_FROM=<floppy>` makes the HD20 bootable |
@@ -169,12 +183,14 @@ a stale catalog back.
 * **Snow warnings.** `IWM unknown read q6 = true q7 = true` during HD20
   writes is Snow noting a register state it does not model; harmless.
 * **Retro68 console apps** (the `CONSOLE` flag) pull in libstdc++ iostreams:
-  900 KB, too large to run here. FujiNetProbe draws into a plain window.
+  900 KB, too large to run here. The apps draw into plain windows.
+* **No arrow keys on the Plus keyboard** Snow emulates (the original
+  M0110), so FujiNet Disks also takes j/k and double-clicks.
 
 ## Next
 
 * NIO on the FujiNet Mac board's ESP32 with the Pico UART as the channel,
   plus RMT track streaming and `'w'` write-capture frames.
 * DiskCopy 4.2 and MOOF floppies.
-* Mac-side CONFIG over the mailbox: host and slot browsing, mounting (the
-  `fn_disk_*` and slot-catalog calls already work through it).
+* A fuller Mac CONFIG: TNFS hosts, the slot catalogue, and images by name
+  in the slot list. FujiNet Disks is the first step.
