@@ -1,0 +1,119 @@
+diff --git a/src/lib/fs_stdio.cpp b/src/lib/fs_stdio.cpp
+index 6805b4e..979b6ea 100644
+--- a/src/lib/fs_stdio.cpp
++++ b/src/lib/fs_stdio.cpp
+@@ -40,18 +40,21 @@ public:
+     std::size_t read(void* dst, std::size_t maxBytes) override
+     {
+         if (!_fp || maxBytes == 0) return 0;
++        switch_to(LastOp::Read);
+         return std::fread(dst, 1, maxBytes, _fp);
+     }
+ 
+     std::size_t write(const void* src, std::size_t bytes) override
+     {
+         if (!_fp || bytes == 0) return 0;
++        switch_to(LastOp::Write);
+         return std::fwrite(src, 1, bytes, _fp);
+     }
+ 
+     bool seek(std::uint64_t offset) override
+     {
+         if (!_fp) return false;
++        _last = LastOp::None;
+         return std::fseek(_fp, static_cast<long>(offset), SEEK_SET) == 0;
+     }
+ 
+@@ -65,11 +68,26 @@ public:
+     bool flush() override
+     {
+         if (!_fp) return false;
++        _last = LastOp::None;
+         return std::fflush(_fp) == 0;
+     }
+ 
+ private:
++    enum class LastOp { None, Read, Write };
++
++    // C requires a positioning call between a read and a write on an update
++    // stream. Without it the write can land where the read buffer ends, not
++    // at the logical position (a sequential read then write drifts).
++    void switch_to(LastOp op)
++    {
++        if (_last != LastOp::None && _last != op) {
++            std::fseek(_fp, 0, SEEK_CUR);
++        }
++        _last = op;
++    }
++
+     std::FILE* _fp{};
++    LastOp _last{LastOp::None};
+ };
+ 
+ // ----------------------
+diff --git a/tests/test_fs_stdio.cpp b/tests/test_fs_stdio.cpp
+new file mode 100644
+index 0000000..4c64c17
+--- /dev/null
++++ b/tests/test_fs_stdio.cpp
+@@ -0,0 +1,60 @@
++#include "doctest.h"
++
++#include "fujinet/fs/fs_stdio.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <filesystem>
++#include <vector>
++
++namespace {
++
++std::vector<std::uint8_t> read_back(const std::filesystem::path& p)
++{
++    std::vector<std::uint8_t> out(std::filesystem::file_size(p));
++    std::FILE* f = std::fopen(p.string().c_str(), "rb");
++    REQUIRE(f);
++    REQUIRE(std::fread(out.data(), 1, out.size(), f) == out.size());
++    std::fclose(f);
++    return out;
++}
++
++} // namespace
++
++TEST_CASE("StdioFile: a write right after a read lands at the logical position")
++{
++    const auto dir = std::filesystem::temp_directory_path() / "fnio_fs_stdio_test";
++    std::filesystem::create_directories(dir);
++    {
++        std::FILE* f = std::fopen((dir / "img.bin").string().c_str(), "wb");
++        REQUIRE(f);
++        std::vector<std::uint8_t> zeros(16 * 512, 0);
++        std::fwrite(zeros.data(), 1, zeros.size(), f);
++        std::fclose(f);
++    }
++
++    auto fs = fujinet::fs::create_stdio_filesystem(dir.string(), "t", fujinet::fs::FileSystemKind::HostPosix);
++    REQUIRE(fs);
++    {
++        auto file = fs->open("/img.bin", "r+b");
++        REQUIRE(file);
++        std::uint8_t block[512];
++        REQUIRE(file->seek(0));
++        REQUIRE(file->read(block, sizeof(block)) == sizeof(block)); // stdio buffers ahead
++        std::vector<std::uint8_t> ones(512, 0x11);
++        REQUIRE(file->write(ones.data(), ones.size()) == ones.size()); // block 1
++        REQUIRE(file->read(block, sizeof(block)) == sizeof(block));    // block 2
++        CHECK(block[0] == 0);
++        std::vector<std::uint8_t> twos(512, 0x22);
++        REQUIRE(file->write(twos.data(), twos.size()) == twos.size()); // block 3
++        REQUIRE(file->flush());
++    }
++
++    const auto bytes = read_back(dir / "img.bin");
++    CHECK(bytes[0 * 512] == 0);
++    CHECK(bytes[1 * 512] == 0x11);
++    CHECK(bytes[2 * 512] == 0);
++    CHECK(bytes[3 * 512] == 0x22);
++    CHECK(bytes[8 * 512] == 0);
++    std::filesystem::remove_all(dir);
++}

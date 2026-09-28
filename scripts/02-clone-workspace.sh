@@ -34,6 +34,7 @@ PATCHES=(
   "0005-fujinet-nio-tcp-connect-errno.patch:repos/fujinet-nio"
   "0006-fujinet-nio-mac-floppy-bus.patch:repos/fujinet-nio"
   "0007-fujinet-nio-lib-mac68k.patch:repos/fujinet-nio-lib"
+  "0008-fujinet-nio-stdio-read-write-switch.patch:repos/fujinet-nio"
 )
 
 for entry in "${PATCHES[@]}"; do

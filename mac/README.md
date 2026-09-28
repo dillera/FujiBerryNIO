@@ -129,6 +129,7 @@ the volume needs neither.
 | --- | --- |
 | `patches/0006-fujinet-nio-mac-floppy-bus.patch` | NIO: `MacFloppyFramer`, profile `Mac68k`/`MacFloppy`, preset `mac-floppy-tcp-debug`, `.hda/.hfv/.dsk` as 512-byte-block images |
 | `patches/0007-fujinet-nio-lib-mac68k.patch` | fujinet-nio-lib: `mac68k` target (Retro68), `src/platform/mac68k/fn_transport.c` |
+| `patches/0008-fujinet-nio-stdio-read-write-switch.patch` | NIO: a write after a read on a stdio image file landed at the end of the read-ahead buffer (found copying files between two HD20s) |
 | `mac/snow/*.patch` | Snow, also committed on branch `fujinet-dcd` of `~/code/snow`: (1) the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner; (2) the FujiNet floppy in the external drive; (3) polled mode on the link |
 | `mac/apps/fnprobe` | FujiNetProbe: clock, HTTP GET and a floppy mount through fujinet-nio-lib; a 56 KB Toolbox app |
 | `mac/apps/fndisks` | FujiNet Disks: browse images on NIO, mount into slots 1-5, eject; a 55 KB Toolbox app |
@@ -136,6 +137,8 @@ the volume needs neither.
 | `mac/tools/run-nio.sh` | Run NIO's Mac bus on `127.0.0.1:65510` (config in `run/fujinet-data/fujinet.yaml`) |
 | `mac/tools/run-snow.sh` | Snow GUI as a Mac Plus with the DCD chain (`SNOW_FUJINET_DCD`) |
 | `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume and the `NIO Floppy` 800K image, with the apps (NIO stopped); `BOOT_FROM=<floppy>` makes the HD20 bootable |
+| `mac/tools/make-system-volume.sh` | Build a bootable System 5.1 HD20 (the System Folder and boot blocks of `run/FujiNet51-config.hda`, the apps, a `<volume> Files` folder of 10K/100K/1000K text files for copy tests) |
+| `mac/tools/tnfs_get.py`, `tnfs_put.py` | Download or list, and upload, TNFS files; `tnfs_put.py --sparse` skips empty blocks, `--base` sends only changed ones |
 | `mac/tools/pico_sim.py` | Plays the Pico against NIO: units, status, HFS blocks, a FujiBus clock call through the mailbox, and a floppy mounted over FujiBus, one of its tracks round-tripped, then ejected |
 | `mac/tools/e2e.sh` | The whole thing headless, with screenshots |
 | `mac/evidence/` | Screenshots from the verified runs |
