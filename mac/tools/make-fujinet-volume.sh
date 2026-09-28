@@ -4,6 +4,8 @@
 # open and would serve the Mac stale blocks of a volume changed under it.
 #
 # usage: make-fujinet-volume.sh [image] [blocks]
+#   BOOT_FROM=<bootable HFS floppy image>  also copy its boot blocks and
+#   System Folder and bless it, so the Mac starts up from the HD20.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 IMG=${1:-$HERE/run/fujinet-data/mac/FujiNet.hda}
@@ -19,6 +21,22 @@ fi
 mkdir -p "$(dirname "$IMG")"
 dd if=/dev/zero of="$IMG" bs=512 count="$BLOCKS" 2>/dev/null
 hformat -l FujiNet "$IMG" >/dev/null
+
+if [ -n "${BOOT_FROM:-}" ]; then
+  # The boot blocks (blocks 0-1) name the System and Finder to launch.
+  dd if="$BOOT_FROM" of="$IMG" bs=512 count=2 conv=notrunc 2>/dev/null
+  TMP=$(mktemp -d)
+  hmount "$BOOT_FROM" >/dev/null
+  for f in System Finder; do hcopy -m ":System Folder:$f" "$TMP/$f.bin"; done
+  humount
+  hmount "$IMG" >/dev/null
+  hmkdir ":System Folder"
+  for f in System Finder; do hcopy -m "$TMP/$f.bin" ":System Folder:$f"; done
+  hattrib -b ":System Folder"
+  humount
+  rm -rf "$TMP"
+fi
+
 hmount "$IMG" >/dev/null
 for app in "$HERE"/apps/*/build/*.bin; do
   [ -f "$app" ] || continue

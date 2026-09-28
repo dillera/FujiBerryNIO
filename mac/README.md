@@ -27,6 +27,14 @@ Verified in the Snow emulator, as a Mac Plus (ROM v3) running System 6.0.8:
   header differs.
 * A Mac eject tells NIO, which unmounts the slot and forgets it, as the
   firmware does.
+* **A Mac Plus with no floppy boots System 6.0.8 from NIO's HD20**
+  (`BOOT_FROM=run/boot608.dsk tools/make-fujinet-volume.sh`).
+
+NIO unit tests (`tests/test_mac_floppy_framer.cpp`, in patch 0006) cover:
+DCD status and block I/O, a two-block mailbox exchange, and floppy tracks
+(encode, round trip, a rewritten sector decoded into the image, step,
+motor, eject). The full suite passes: 386 of 386, in both the
+`mac-floppy-tcp-debug` and `fujibus-tcp-debug` builds.
 
 ![FujiNetProbe on a Mac Plus](evidence/probe-clock-http.png)
 
@@ -108,7 +116,7 @@ the volume needs neither.
 | `mac/apps/fnprobe` | FujiNetProbe: clock, HTTP GET and a floppy mount through fujinet-nio-lib; a 56 KB Toolbox app |
 | `mac/tools/run-nio.sh` | Run NIO's Mac bus on `127.0.0.1:65510` (config in `run/fujinet-data/fujinet.yaml`) |
 | `mac/tools/run-snow.sh` | Snow GUI as a Mac Plus with the DCD chain (`SNOW_FUJINET_DCD`) |
-| `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume and the `NIO Floppy` 800K image, with the apps (NIO stopped) |
+| `mac/tools/make-fujinet-volume.sh` | Build the `FujiNet` HD20 volume and the `NIO Floppy` 800K image, with the apps (NIO stopped); `BOOT_FROM=<floppy>` makes the HD20 bootable |
 | `mac/tools/pico_sim.py` | Plays the Pico against NIO: units, status, HFS blocks, a FujiBus clock call through the mailbox, and a floppy mounted over FujiBus, one of its tracks round-tripped, then ejected |
 | `mac/tools/e2e.sh` | The whole thing headless, with screenshots |
 | `mac/evidence/` | Screenshots from the verified runs |

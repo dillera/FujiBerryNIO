@@ -400,35 +400,43 @@ index 5342d61..712de18 100644
          lib/transport/legacy/iwm_traits.cpp
          lib/transport/legacy/iwm_transport.cpp
 diff --git a/src/lib/bootstrap.cpp b/src/lib/bootstrap.cpp
-index befb86d..db2fc08 100644
+index befb86d..2922bb8 100644
 --- a/src/lib/bootstrap.cpp
 +++ b/src/lib/bootstrap.cpp
-@@ -3,6 +3,10 @@
+@@ -3,6 +3,12 @@
  #include "fujinet/io/transport/fujibus_transport.h"
  #include "fujinet/io/transport/slip_framer.h"
  #include "fujinet/io/transport/native_framer.h"
 +#include "fujinet/io/transport/mac_floppy_framer.h"
 +#include "fujinet/io/devices/disk_device.h"
++#include "fujinet/disk/disk_service.h"
++#include "fujinet/disk/image_registry.h"
 +#include "fujinet/io/protocol/wire_device_ids.h"
 +#include "fujinet/core/logging.h"
  #include "fujinet/config/fuji_config.h"
  // #include "fujinet/io/transport/iec_transport.h"
  // etc.
-@@ -79,6 +83,22 @@ io::ITransport* setup_transports(FujinetCore& core,
+@@ -79,6 +85,28 @@ io::ITransport* setup_transports(FujinetCore& core,
          // ...
          break;
      }
 +    case TransportKind::MacFloppy: {
 +        // The framer serves DCD blocks straight from the disk service and
 +        // hands mailbox packets to an ordinary FujiBus transport.
++        // Normally the disk device is registered first, and the Mac's disks
++        // are its slots. Without one (an embedder), serve an empty set of
++        // slots so FujiBus still works.
 +        auto* disk = dynamic_cast<io::DiskDevice*>(core.deviceManager().getDevice(
 +            io::protocol::to_device_id(io::protocol::WireDeviceId::DiskService)));
-+        if (!disk) {
-+            FN_LOGE("bootstrap", "Mac floppy bus needs the disk device registered first");
-+            break;
++        io::MacFloppyFramer* framer = nullptr;
++        if (disk) {
++            framer = new io::MacFloppyFramer(
++                disk->disk_service(), [disk](std::size_t slot) { disk->eject(slot); });
++        } else {
++            FN_LOGW("bootstrap", "Mac floppy bus: no disk device registered, no disks served");
++            auto* disks = new disk::DiskService(core.storageManager(), disk::make_default_image_registry());
++            framer = new io::MacFloppyFramer(*disks);
 +        }
-+        auto* framer = new io::MacFloppyFramer(
-+            disk->disk_service(), [disk](std::size_t slot) { disk->eject(slot); });
 +        auto* t = new io::FujiBusTransport(channel, *framer);
 +        core.addTransport(t);
 +        primary = t;
@@ -1546,3 +1554,232 @@ index 0000000..9b1c314
 +}
 +
 +} // namespace fujinet::io
+diff --git a/tests/test_mac_floppy_framer.cpp b/tests/test_mac_floppy_framer.cpp
+new file mode 100644
+index 0000000..6b5cf64
+--- /dev/null
++++ b/tests/test_mac_floppy_framer.cpp
+@@ -0,0 +1,223 @@
++#include "doctest.h"
++
++#include "fake_fs.h"
++
++#include "fujinet/disk/disk_service.h"
++#include "fujinet/disk/image_registry.h"
++#include "fujinet/disk/mac_gcr.h"
++#include "fujinet/fs/storage_manager.h"
++#include "fujinet/io/core/channel.h"
++#include "fujinet/io/transport/mac_floppy_framer.h"
++
++#include <cstdint>
++#include <cstring>
++#include <deque>
++#include <memory>
++#include <vector>
++
++using fujinet::io::MacFloppyFramer;
++
++namespace {
++
++// The drive side (the board's Pico, or an emulator) as the framer sees it.
++class DriveSide : public fujinet::io::Channel {
++public:
++    bool available() override { return !in.empty(); }
++    std::size_t read(std::uint8_t* buffer, std::size_t maxLen) override
++    {
++        std::size_t n = 0;
++        while (n < maxLen && !in.empty()) {
++            buffer[n++] = in.front();
++            in.pop_front();
++        }
++        return n;
++    }
++    void write(const std::uint8_t* buffer, std::size_t len) override
++    {
++        out.insert(out.end(), buffer, buffer + len);
++    }
++
++    void send(std::initializer_list<std::uint8_t> bytes) { in.insert(in.end(), bytes); }
++    void send(const std::vector<std::uint8_t>& bytes) { in.insert(in.end(), bytes.begin(), bytes.end()); }
++    std::vector<std::uint8_t> take()
++    {
++        std::vector<std::uint8_t> r;
++        r.swap(out);
++        return r;
++    }
++
++    std::deque<std::uint8_t> in;
++    std::vector<std::uint8_t> out;
++};
++
++constexpr std::uint32_t kHdBlocks = 64;
++
++std::vector<std::uint8_t> patterned(std::size_t sectors)
++{
++    std::vector<std::uint8_t> bytes(sectors * 512);
++    for (std::size_t i = 0; i < bytes.size(); ++i) {
++        bytes[i] = std::uint8_t((i / 512) * 7 + i);
++    }
++    return bytes;
++}
++
++struct Rig {
++    fujinet::fs::StorageManager sm;
++    fujinet::tests::MemoryFileSystem* fs{nullptr};
++    std::unique_ptr<fujinet::disk::DiskService> disks;
++    std::unique_ptr<MacFloppyFramer> framer;
++    DriveSide drive;
++
++    Rig()
++    {
++        auto owned = std::make_unique<fujinet::tests::MemoryFileSystem>("mem");
++        fs = owned.get();
++        owned->file_bytes("/hd.hda") = patterned(kHdBlocks);
++        owned->file_bytes("/fl.dsk") = patterned(1600);
++        REQUIRE(sm.registerFileSystem(std::move(owned)));
++        disks = std::make_unique<fujinet::disk::DiskService>(sm, fujinet::disk::make_default_image_registry());
++        REQUIRE(disks->mount(0, "mem", "/hd.hda", {}).ok());
++        framer = std::make_unique<MacFloppyFramer>(*disks);
++        exchange({'?'}); // a drive side says hello first
++    }
++
++    std::vector<std::uint8_t> exchange(const std::vector<std::uint8_t>& cmd)
++    {
++        drive.send(cmd);
++        framer->poll(drive);
++        return drive.take();
++    }
++
++    std::vector<std::uint8_t> read_block(std::uint32_t block)
++    {
++        return exchange({'R', std::uint8_t(block >> 16), std::uint8_t(block >> 8), std::uint8_t(block)});
++    }
++
++    std::uint8_t write_block(std::uint32_t block, const std::vector<std::uint8_t>& data)
++    {
++        std::vector<std::uint8_t> cmd{'W', std::uint8_t(block >> 16), std::uint8_t(block >> 8),
++                                      std::uint8_t(block)};
++        cmd.insert(cmd.end(), data.begin(), data.end());
++        const auto r = exchange(cmd);
++        REQUIRE(r.size() == 1);
++        return r[0];
++    }
++};
++
++} // namespace
++
++TEST_CASE("MacFloppyFramer: DCD unit count, status and block I/O")
++{
++    Rig rig;
++
++    CHECK(rig.exchange({'?'}) == std::vector<std::uint8_t>{'h', 1});
++
++    const auto status = rig.exchange({'A', 'T'});
++    REQUIRE(status.size() == MacFloppyFramer::STATUS_BYTES);
++    // Payload offsets 10..13 of the HD20 status reply: flags, block count.
++    CHECK(status[10 - 6] == 0xE6);
++    const std::uint32_t blocks = (std::uint32_t(status[11 - 6]) << 16) |
++                                 (std::uint32_t(status[12 - 6]) << 8) | status[13 - 6];
++    CHECK(blocks == kHdBlocks + MacFloppyFramer::MAILBOX_BLOCKS);
++
++    const auto block5 = rig.read_block(5);
++    REQUIRE(block5.size() == 512);
++    CHECK(block5[0] == std::uint8_t(5 * 7 + 5 * 512));
++
++    std::vector<std::uint8_t> data(512, 0x5A);
++    CHECK(rig.write_block(7, data) == 'w');
++    CHECK(rig.read_block(7) == data);
++    CHECK(rig.write_block(kHdBlocks + MacFloppyFramer::MAILBOX_BLOCKS, data) == 'e');
++}
++
++TEST_CASE("MacFloppyFramer: FujiBus packets through the mailbox blocks")
++{
++    Rig rig;
++    const std::uint32_t base = kHdBlocks;
++
++    auto idle = rig.read_block(base);
++    CHECK(std::memcmp(idle.data(), "FNIO", 4) == 0);
++    CHECK(idle[5] == 0);
++
++    // A 600-byte request spans two mailbox blocks.
++    std::vector<std::uint8_t> packet(600);
++    for (std::size_t i = 0; i < packet.size(); ++i) {
++        packet[i] = std::uint8_t(i * 3);
++    }
++    std::vector<std::uint8_t> mailbox(1024, 0);
++    std::memcpy(mailbox.data(), "FNIO", 4);
++    mailbox[4] = 1;
++    mailbox[7] = 42; // seq
++    mailbox[10] = std::uint8_t(packet.size() >> 8);
++    mailbox[11] = std::uint8_t(packet.size());
++    std::memcpy(mailbox.data() + 16, packet.data(), packet.size());
++
++    fujinet::io::ByteBuffer got;
++    CHECK(rig.write_block(base, {mailbox.begin(), mailbox.begin() + 512}) == 'w');
++    CHECK_FALSE(rig.framer->nextPacket(got));
++    CHECK(rig.read_block(base)[5] == 2); // pending
++    CHECK(rig.write_block(base + 1, {mailbox.begin() + 512, mailbox.end()}) == 'w');
++    REQUIRE(rig.framer->nextPacket(got));
++    CHECK(got == packet);
++
++    const fujinet::io::ByteBuffer response{1, 2, 3, 4, 5};
++    rig.framer->sendPacket(rig.drive, response);
++    CHECK(rig.drive.take().empty()); // nothing goes on the wire
++    const auto ready = rig.read_block(base);
++    CHECK(ready[5] == 1);
++    CHECK(ready[7] == 42);
++    CHECK(ready[11] == 5);
++    CHECK(std::vector<std::uint8_t>(ready.begin() + 16, ready.begin() + 21) == response);
++
++    // The image itself is untouched by mailbox traffic.
++    CHECK(rig.read_block(kHdBlocks - 1)[0] == std::uint8_t((kHdBlocks - 1) * 7 + (kHdBlocks - 1) * 512));
++}
++
++TEST_CASE("MacFloppyFramer: 800K floppy tracks, write-back and eject")
++{
++    Rig rig;
++    rig.exchange({'?'});
++
++    REQUIRE(rig.disks->mount(MacFloppyFramer::FLOPPY_SLOT, "mem", "/fl.dsk", {}).ok());
++    CHECK(rig.exchange({}) == std::vector<std::uint8_t>{'d', 0x80, 'u'});
++
++    auto reply = rig.exchange({'#', 0, 0});
++    REQUIRE(reply.size() >= 4);
++    const std::uint32_t nbits = (std::uint32_t(reply[0]) << 24) | (std::uint32_t(reply[1]) << 16) |
++                                (std::uint32_t(reply[2]) << 8) | reply[3];
++    CHECK(nbits == mac_gcr_track_bits(0));
++    std::vector<std::uint8_t> track(reply.begin() + 4, reply.end());
++    REQUIRE(track.size() == nbits / 8);
++
++    std::vector<mac_gcr_written_sector> found(24);
++    const int n = mac_gcr_decode_capture(track.data(), nbits, found.data(), int(found.size()));
++    CHECK(n == mac_gcr_sectors_per_track(0));
++    for (int i = 0; i < n; ++i) {
++        CHECK(found[std::size_t(i)].checksum_ok);
++    }
++
++    auto put = [&](const std::vector<std::uint8_t>& bits) {
++        std::vector<std::uint8_t> cmd{'P', 0, 0, std::uint8_t(nbits >> 24), std::uint8_t(nbits >> 16),
++                                      std::uint8_t(nbits >> 8), std::uint8_t(nbits)};
++        cmd.insert(cmd.end(), bits.begin(), bits.end());
++        return rig.exchange(cmd);
++    };
++    CHECK(put(track) == std::vector<std::uint8_t>{'p', 0});
++
++    // The Mac rewrites logical sector 3 of cylinder 0, side 0.
++    std::uint8_t sector[MAC_GCR_SECTOR_TOTAL];
++    std::memset(sector, 0, MAC_GCR_TAG_SIZE);
++    std::memset(sector + MAC_GCR_TAG_SIZE, 0xC3, MAC_GCR_SECTOR_SIZE);
++    REQUIRE(mac_gcr_patch_sector(track.data(), track.size(), 0, MAC_GCR_FORMAT_DS, 3, sector));
++    CHECK(put(track) == std::vector<std::uint8_t>{'p', 1});
++    std::uint8_t image[512];
++    REQUIRE(rig.disks->read_sector(MacFloppyFramer::FLOPPY_SLOT, 3, image, sizeof(image)).ok());
++    CHECK(image[0] == 0xC3);
++    CHECK(image[511] == 0xC3);
++
++    CHECK(rig.exchange({'0', '1'}) == std::vector<std::uint8_t>{0x81});
++    CHECK(rig.exchange({'2'}) == std::vector<std::uint8_t>{'M'});
++    CHECK(rig.exchange({'7'}) == std::vector<std::uint8_t>{'E'});
++    CHECK_FALSE(rig.disks->info(MacFloppyFramer::FLOPPY_SLOT).inserted);
++    CHECK(rig.exchange({'1'}) == std::vector<std::uint8_t>{'N'});
++}
