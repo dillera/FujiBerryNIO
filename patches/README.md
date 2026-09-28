@@ -12,6 +12,8 @@ with `git apply` inside the listed repo.
 | `0003` | `fujinet-nio-driver` | Native test uses `mkdtemp()` under strict `_POSIX_C_SOURCE`; macOS hides it without `_DARWIN_C_SOURCE` (the file already sets glibc's `_DEFAULT_SOURCE`) |
 | `0004` | `fujinet-nio-driver` | **`fujinet-nio.device` crashes Kickstart 1.3 on a 68000** — see below |
 | `0005` | `fujinet-nio` | Every `tcp://` session failed on macOS: `step_connect()` read a stale `errno` after `poll()` timed out (poll leaves errno untouched), so a connect still in progress was marked failed and the first write got an I/O error. `poll_connect_complete()` now clears errno when not yet ready |
+| `0006` | `fujinet-nio` | **New: Macintosh floppy-port bus.** `MacFloppyFramer` speaks the FujiNet Mac board's Pico protocol (DCD/HD20 block I/O) and carries FujiBus through mailbox blocks past the end of each HD20 volume; build preset `mac-floppy-tcp-debug`. `.hda`/`.hfv`/`.dsk` mount as 512-byte-block raw images. See `mac/README.md` |
+| `0007` | `fujinet-nio-lib` | **New: `mac68k` target** (Retro68). The transport is block I/O to that mailbox through the ROM's HD20 driver, so classic Mac programs use the same `fn_*` API as the Amiga |
 
 ## 0004: the Kickstart 1.3 crash (not macOS-specific)
 

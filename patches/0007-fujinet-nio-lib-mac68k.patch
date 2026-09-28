@@ -1,0 +1,306 @@
+diff --git a/Makefile b/Makefile
+index 03a1b65..be1665c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,7 +14,7 @@
+ # Supported targets
+ # TARGETS = atari apple2 apple2enh bbc c64 coco msdos linux
+ TARGETS = atari bbc bbc-clib msdos-serial msdos-ioctl msdos-f5 linux amiga
+-EXTRA_TARGETS = amiga-driver
++EXTRA_TARGETS = amiga-driver mac68k
+ 
+ # Output library name
+ override PROGRAM := fujinet-nio
+diff --git a/makefiles/build.mk b/makefiles/build.mk
+index 1c36dba..e48d624 100644
+--- a/makefiles/build.mk
++++ b/makefiles/build.mk
+@@ -23,7 +23,7 @@ INCDIR      := include
+ PLATFORM_DIR := $(SRCDIR)/platform/$(PLATFORM)
+ 
+ # Library extension (GCC/amigagcc use .a, CC65 uses .lib)
+-ifneq (,$(filter $(COMPILER_FAMILY),gcc amigagcc))
++ifneq (,$(filter $(COMPILER_FAMILY),gcc amigagcc macgcc))
+     LIBEXT := .a
+ else
+     LIBEXT := .lib
+@@ -213,7 +213,7 @@ $(OBJDIR)/$(TARGET)/platform/$(PLATFORM)/%.o: $(SRCDIR)/platform/$(PLATFORM)/%.s
+ 	$(CC) -t $(TARGET) -c $(ASFLAGS) --listing $(@:.o=.lst) -o $@ $<
+ 
+ # Compile C files
+-ifneq (,$(filter $(COMPILER_FAMILY),gcc amigagcc))
++ifneq (,$(filter $(COMPILER_FAMILY),gcc amigagcc macgcc))
+ # GCC / amiga-gcc compilation
+ $(OBJDIR)/$(TARGET)/common/%.o: $(SRCDIR)/common/%.c | $(OBJDIR)/$(TARGET)/common
+ 	@echo "  CC $<"
+@@ -255,7 +255,7 @@ $(OBJDIR)/$(TARGET)/platform/$(PLATFORM)/%.o: $(SRCDIR)/platform/$(PLATFORM)/%.c
+ endif
+ 
+ # Create library
+-ifneq (,$(filter $(COMPILER_FAMILY),gcc amigagcc))
++ifneq (,$(filter $(COMPILER_FAMILY),gcc amigagcc macgcc))
+ $(LIBRARY): $(OBJECTS) | $(BUILDDIR)
+ 	@echo "  AR $@"
+ 	$(AR) rcs $@ $(OBJECTS)
+diff --git a/makefiles/compiler-macgcc.mk b/makefiles/compiler-macgcc.mk
+new file mode 100644
+index 0000000..1add80d
+--- /dev/null
++++ b/makefiles/compiler-macgcc.mk
+@@ -0,0 +1,16 @@
++# compiler-macgcc.mk - Retro68 cross-compiler for the classic 68k Mac
++#
++# Requires a built Retro68 toolchain:
++#   https://github.com/autc04/Retro68
++# Add to PATH: export PATH=$RETRO68_BUILD/toolchain/bin:$PATH
++
++CC      = m68k-apple-macos-gcc
++AR      = m68k-apple-macos-ar
++AS      = m68k-apple-macos-as
++
++# -mcpu=68000: every Mac with HD20 support in ROM (512Ke, Plus, SE) and up
++CFLAGS  = -Wall -O2 -std=gnu99 -mcpu=68000 -ffunction-sections -fdata-sections
++
++ASFLAGS =
++ARFLAGS = rcs
++LIBEXT  = .a
+diff --git a/makefiles/compiler.mk b/makefiles/compiler.mk
+index 7f6887c..e4ba603 100644
+--- a/makefiles/compiler.mk
++++ b/makefiles/compiler.mk
+@@ -17,6 +17,8 @@ else ifeq ($(COMPILER_FAMILY),gcc)
+     -include makefiles/compiler-gcc.mk
+ else ifeq ($(COMPILER_FAMILY),amigagcc)
+     -include makefiles/compiler-amigagcc.mk
++else ifeq ($(COMPILER_FAMILY),macgcc)
++    -include makefiles/compiler-macgcc.mk
+ else
+     $(error Unknown compiler family: $(COMPILER_FAMILY))
+ endif
+diff --git a/makefiles/targets.mk b/makefiles/targets.mk
+index 0dbf8df..2deb79d 100644
+--- a/makefiles/targets.mk
++++ b/makefiles/targets.mk
+@@ -19,6 +19,7 @@ PLATFORM_msdos-f5 := msdos
+ PLATFORM_linux      := linux
+ PLATFORM_amiga      := amiga
+ PLATFORM_amiga-driver := amiga
++PLATFORM_mac68k     := mac68k
+ 
+ # Get platform for current target
+ PLATFORM := $(PLATFORM_$(TARGET))
+@@ -40,6 +41,7 @@ COMPILER_FAMILY_msdos-f5 := wcc
+ COMPILER_FAMILY_linux      := gcc
+ COMPILER_FAMILY_amiga      := amigagcc
+ COMPILER_FAMILY_amiga-driver := amigagcc
++COMPILER_FAMILY_mac68k     := macgcc
+ 
+ # Get compiler family for current target
+ COMPILER_FAMILY := $(COMPILER_FAMILY_$(TARGET))
+@@ -120,6 +122,12 @@ TARGET_ASFLAGS_amiga    :=
+ TARGET_CFLAGS_amiga-driver := -mcpu=68000 -msoft-float -DFN_AMIGA_EXPLICIT_LIFECYCLE $(AMIGA_NIO_DEVICE_INCLUDE)
+ TARGET_ASFLAGS_amiga-driver :=
+ 
++# Classic Macintosh 68k (Retro68). The transport is block I/O to the
++# FujiNet's HD20 mailbox through the ROM .Sony driver; see
++# src/platform/mac68k/fn_transport.c.
++TARGET_CFLAGS_mac68k    := -mcpu=68000
++TARGET_ASFLAGS_mac68k   :=
++
+ # Get flags for current target
+ TARGET_CFLAGS  := $(TARGET_CFLAGS_$(TARGET))
+ TARGET_ASFLAGS := $(TARGET_ASFLAGS_$(TARGET))
+diff --git a/src/platform/mac68k/fn_transport.c b/src/platform/mac68k/fn_transport.c
+new file mode 100644
+index 0000000..4f5d322
+--- /dev/null
++++ b/src/platform/mac68k/fn_transport.c
+@@ -0,0 +1,188 @@
++/*
++ * fn_transport.c - classic Macintosh (68k) transport over the floppy port
++ *
++ * The FujiNet Mac board presents its disks to the Mac as Directly Connected
++ * Disks (HD20s) on the floppy port. fujinet-nio makes every such unit
++ * FN_MAC_MAILBOX_BLOCKS blocks longer than its image; those blocks are a
++ * mailbox: writing them sends one raw FujiBus packet, reading them returns
++ * the response. So the whole transport is ordinary driver-level block I/O
++ * through the ROM's HD20 support in the .Sony driver: no INIT, no driver,
++ * no hardware access.
++ *
++ *   mailbox block 0: "FNIO" version state seq(u16) length(u32) reserved(4)
++ *                    then the packet; state 1 = response ready.
++ *
++ * Compiler: Retro68 (m68k-apple-macos-gcc). Runs on a 512Ke/Plus/SE and up
++ * (any Mac whose ROM drives HD20s); System 6.0.8 tested.
++ */
++
++#include <Files.h>
++#include <Devices.h>
++#include <Events.h>
++
++#include <string.h>
++
++#include "fujinet-nio.h"
++#include "fn_platform.h"
++#include "fn_internal.h"
++
++#define FN_MAC_MAILBOX_BLOCKS 16
++#define FN_MAC_BLOCK 512
++#define FN_MAC_HEADER 16
++#define FN_MAC_MAILBOX_BYTES (FN_MAC_MAILBOX_BLOCKS * FN_MAC_BLOCK)
++#define FN_MAC_TIMEOUT_TICKS (60 * 10)
++
++enum { MB_IDLE = 0, MB_READY = 1, MB_PENDING = 2 };
++
++static struct {
++    short drive;      /* drive number in the drive queue */
++    short refnum;     /* its driver (.Sony) */
++    long base;        /* first mailbox block */
++    uint16_t seq;
++    uint8_t ready;
++} g_mac;
++
++/* Word aligned: the driver moves words into it, and an odd address is an
++ * address error on a 68000. */
++static uint8_t g_blocks[FN_MAC_MAILBOX_BYTES] __attribute__((aligned(4)));
++
++static OSErr block_io(short trap_write, long block, uint8_t *buf, long count)
++{
++    ParamBlockRec pb;
++
++    memset(&pb, 0, sizeof(pb));
++    pb.ioParam.ioRefNum = g_mac.refnum;
++    pb.ioParam.ioVRefNum = g_mac.drive;
++    pb.ioParam.ioBuffer = (Ptr)buf;
++    pb.ioParam.ioReqCount = count * FN_MAC_BLOCK;
++    pb.ioParam.ioPosMode = fsFromStart;
++    pb.ioParam.ioPosOffset = block * FN_MAC_BLOCK;
++    return trap_write ? PBWriteSync(&pb) : PBReadSync(&pb);
++}
++
++/* DrvQHdr is a low-memory global at $308; GetDrvQHdr() is glue that Retro68
++ * does not ship. GCC flags any fixed-address access as out of bounds. */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Warray-bounds"
++static DrvQEl *first_drive(void)
++{
++    return (DrvQEl *)((QHdrPtr)0x0308)->qHead;
++}
++#pragma GCC diagnostic pop
++
++static long drive_blocks(const DrvQEl *q)
++{
++    /* qType 1: the size is 32 bits, dQDrvSz2 the high word. */
++    if (q->qType == 1)
++        return ((long)q->dQDrvSz2 << 16) | q->dQDrvSz;
++    return q->dQDrvSz;
++}
++
++uint8_t fn_transport_init(void)
++{
++    DrvQEl *q;
++
++    if (g_mac.ready)
++        return FN_OK;
++
++    for (q = first_drive(); q != NULL; q = (DrvQEl *)q->qLink) {
++        long blocks = drive_blocks(q);
++
++        if (blocks <= FN_MAC_MAILBOX_BLOCKS)
++            continue;
++        g_mac.drive = q->dQDrive;
++        g_mac.refnum = q->dQRefNum;
++        g_mac.base = blocks - FN_MAC_MAILBOX_BLOCKS;
++        if (block_io(0, g_mac.base, g_blocks, 1) == noErr &&
++            memcmp(g_blocks, "FNIO", 4) == 0) {
++            g_mac.seq = (uint16_t)((g_blocks[6] << 8) | g_blocks[7]);
++            g_mac.ready = 1;
++            return FN_OK;
++        }
++    }
++    return FN_ERR_NOT_FOUND;
++}
++
++void fn_transport_close(void)
++{
++    g_mac.ready = 0;
++}
++
++uint8_t fn_transport_ready(void)
++{
++    return g_mac.ready;
++}
++
++uint8_t fn_transport_exchange(void)
++{
++    return fn_transport_exchange_buffers(_fn_transport_ctx.request,
++                                         _fn_transport_ctx.req_len,
++                                         _fn_transport_ctx.response,
++                                         _fn_transport_ctx.resp_max,
++                                         &_fn_transport_ctx.resp_len);
++}
++
++uint8_t fn_transport_exchange_buffers(const uint8_t *request,
++                                      uint16_t request_length,
++                                      uint8_t *response,
++                                      uint16_t response_capacity,
++                                      uint16_t *response_length)
++{
++    long nblocks, got, deadline;
++    uint32_t length;
++    uint16_t seq;
++
++    if (response_length == NULL || request == NULL || response == NULL)
++        return FN_ERR_INVALID;
++    *response_length = 0;
++    if (!g_mac.ready)
++        return FN_ERR_NOT_FOUND;
++    if ((long)request_length + FN_MAC_HEADER > FN_MAC_MAILBOX_BYTES)
++        return FN_ERR_INVALID;
++
++    seq = ++g_mac.seq;
++    memset(g_blocks, 0, FN_MAC_HEADER);
++    memcpy(g_blocks, "FNIO", 4);
++    g_blocks[4] = 1;
++    g_blocks[6] = (uint8_t)(seq >> 8);
++    g_blocks[7] = (uint8_t)seq;
++    g_blocks[10] = (uint8_t)(request_length >> 8);
++    g_blocks[11] = (uint8_t)request_length;
++    memcpy(g_blocks + FN_MAC_HEADER, request, request_length);
++    nblocks = ((long)request_length + FN_MAC_HEADER + FN_MAC_BLOCK - 1) / FN_MAC_BLOCK;
++    if (block_io(1, g_mac.base, g_blocks, nblocks) != noErr)
++        return FN_ERR_IO;
++
++    /* The FujiNet usually answers before the write completes on the Mac
++     * side; poll the header block until the response for this seq is up. */
++    deadline = TickCount() + FN_MAC_TIMEOUT_TICKS;
++    for (;;) {
++        if (block_io(0, g_mac.base, g_blocks, 1) != noErr)
++            return FN_ERR_IO;
++        if (memcmp(g_blocks, "FNIO", 4) != 0)
++            return FN_ERR_IO;
++        if (g_blocks[5] == MB_READY &&
++            ((uint16_t)((g_blocks[6] << 8) | g_blocks[7])) == seq)
++            break;
++        if (TickCount() > deadline)
++            return FN_ERR_TIMEOUT;
++    }
++
++    length = ((uint32_t)g_blocks[8] << 24) | ((uint32_t)g_blocks[9] << 16) |
++             ((uint32_t)g_blocks[10] << 8) | g_blocks[11];
++    if (length > response_capacity || length + FN_MAC_HEADER > FN_MAC_MAILBOX_BYTES)
++        return FN_ERR_INVALID;
++    nblocks = ((long)length + FN_MAC_HEADER + FN_MAC_BLOCK - 1) / FN_MAC_BLOCK;
++    if (nblocks > 1 &&
++        block_io(0, g_mac.base + 1, g_blocks + FN_MAC_BLOCK, nblocks - 1) != noErr)
++        return FN_ERR_IO;
++    got = (long)length;
++    memcpy(response, g_blocks + FN_MAC_HEADER, (size_t)got);
++    *response_length = (uint16_t)got;
++    return FN_OK;
++}
++
++const char *fn_platform_name(void)
++{
++    return "mac68k";
++}

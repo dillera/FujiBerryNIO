@@ -1,0 +1,1061 @@
+From caea6c15022a6a91ea1e7bdb3f06fe41b42f8863 Mon Sep 17 00:00:00 2001
+From: Andrew Diller <dillera@dillernet.com>
+Date: Sun, 27 Sep 2026 22:23:43 -0400
+Subject: [PATCH] Add a FujiNet-served DCD (HD20) chain on the external drive
+ port
+
+The drive side of the Directly Connected Disk protocol, bit-timed through
+the IWM like a real device: phase states 0-7, !HSHK on the sense line,
+7-to-8 group coding with holdoff/resume, CA3 (LSTRB) daisy chaining, and
+read/write/status/ID/format commands. Blocks come from a FujiNet over TCP
+using the FujiNet Mac board's Pico <-> FujiNet protocol, so the emulated
+Mac talks to fujinet-nio exactly as a real Mac does through the board.
+
+Enabled with SNOW_FUJINET_DCD=host:port. Units come and go as the FujiNet
+reports mounts; save states skip the live link.
+
+Also adds testrunner/fnrun, a scripted headless runner (mouse, keys,
+screenshots) used to test it.
+---
+ core/src/mac/swim/dcd.rs         | 657 +++++++++++++++++++++++++++++++
+ core/src/mac/swim/iwm.rs         |  56 ++-
+ core/src/mac/swim/mod.rs         |  28 ++
+ testrunner/src/bin/fnrun/main.rs | 202 ++++++++++
+ 4 files changed, 940 insertions(+), 3 deletions(-)
+ create mode 100644 core/src/mac/swim/dcd.rs
+ create mode 100644 testrunner/src/bin/fnrun/main.rs
+
+diff --git a/core/src/mac/swim/dcd.rs b/core/src/mac/swim/dcd.rs
+new file mode 100644
+index 0000000..8c10275
+--- /dev/null
++++ b/core/src/mac/swim/dcd.rs
+@@ -0,0 +1,657 @@
++//! Directly Connected Disk (DCD, "HD20") chain on the external drive port,
++//! served by a FujiNet.
++//!
++//! This plays the part of the Raspberry Pi Pico on the FujiNet Mac 68k board:
++//! the drive side of the DCD protocol runs here, bit-timed through the IWM
++//! like a real device, and the blocks come from a FujiNet (fujinet-nio's Mac
++//! floppy-port bus) over TCP using the board's Pico <-> FujiNet protocol:
++//!
++//! ```text
++//!   Snow -> FujiNet   'A'..'D' select unit, 'R' b2 b1 b0 read block,
++//!                     'W' b2 b1 b0 <512> write block, 'T' status, '?' units
++//!   FujiNet -> Snow   512 block bytes, 'w'/'e' write ack, 336 status bytes,
++//!                     'h' n  (n units mounted; also unsolicited on change)
++//! ```
++//!
++//! Enabled by `SNOW_FUJINET_DCD=host:port` in the environment.
++//!
++//! Protocol reference: tashnotes, macintosh/floppy/dcd (Tashtari), and the
++//! FujiNet Mac Pico firmware (pico/mac/commands.c).
++
++use std::collections::VecDeque;
++use std::io::{Read, Write};
++use std::net::TcpStream;
++use std::time::{Duration, Instant};
++
++use log::*;
++
++/// One DCD bit cell: 96/47 us (~2.04 us); the Mac Plus runs at 7.8336 MHz.
++pub const DCD_TICKS_PER_BIT: u64 = 16;
++
++const IO_TIMEOUT: Duration = Duration::from_secs(5);
++const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
++const MAX_UNITS: usize = 4;
++
++/// TCP link to the FujiNet, speaking the Pico's side of the board protocol.
++struct Link {
++    stream: TcpStream,
++}
++
++impl Link {
++    fn connect(addr: &str) -> std::io::Result<Self> {
++        let stream = TcpStream::connect(addr)?;
++        stream.set_nodelay(true)?;
++        stream.set_read_timeout(Some(IO_TIMEOUT))?;
++        stream.set_write_timeout(Some(IO_TIMEOUT))?;
++        Ok(Self { stream })
++    }
++
++    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
++        self.stream.read_exact(buf)
++    }
++
++    /// Consumes unsolicited 'h' n announcements; returns the latest count.
++    fn drain(&mut self) -> std::io::Result<Option<usize>> {
++        let mut units = None;
++        self.stream.set_nonblocking(true)?;
++        let mut b = [0u8; 1];
++        let result = loop {
++            match self.stream.read(&mut b) {
++                Ok(0) => {
++                    break Err(std::io::Error::new(
++                        std::io::ErrorKind::UnexpectedEof,
++                        "FujiNet closed the link",
++                    ));
++                }
++                Ok(_) if b[0] == b'h' => {
++                    self.stream.set_nonblocking(false)?;
++                    let mut n = [0u8; 1];
++                    self.stream.read_exact(&mut n)?;
++                    units = Some(n[0] as usize);
++                    self.stream.set_nonblocking(true)?;
++                }
++                Ok(_) => warn!("DCD: unexpected byte {:02X} from FujiNet", b[0]),
++                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break Ok(units),
++                Err(e) => break Err(e),
++            }
++        };
++        self.stream.set_nonblocking(false)?;
++        result
++    }
++
++    fn query_units(&mut self) -> std::io::Result<usize> {
++        self.drain()?;
++        self.stream.write_all(b"?")?;
++        let mut r = [0u8; 2];
++        self.read_exact(&mut r)?;
++        if r[0] != b'h' {
++            return Err(std::io::Error::other("bad reply to unit query"));
++        }
++        Ok(r[1] as usize)
++    }
++
++    fn select(&mut self, unit: usize) -> std::io::Result<()> {
++        self.stream.write_all(&[b'A' + unit as u8])
++    }
++
++    fn read_block(&mut self, unit: usize, block: u32, out: &mut [u8; 512]) -> std::io::Result<()> {
++        self.select(unit)?;
++        let b = block.to_be_bytes();
++        self.stream.write_all(&[b'R', b[1], b[2], b[3]])?;
++        self.read_exact(out)
++    }
++
++    fn write_block(&mut self, unit: usize, block: u32, data: &[u8]) -> std::io::Result<bool> {
++        self.select(unit)?;
++        let b = block.to_be_bytes();
++        let mut msg = Vec::with_capacity(4 + 512);
++        msg.extend_from_slice(&[b'W', b[1], b[2], b[3]]);
++        msg.extend_from_slice(&data[..512]);
++        self.stream.write_all(&msg)?;
++        let mut ack = [0u8; 1];
++        self.read_exact(&mut ack)?;
++        Ok(ack[0] == b'w')
++    }
++
++    fn status(&mut self, unit: usize, out: &mut [u8; 336]) -> std::io::Result<()> {
++        self.select(unit)?;
++        self.stream.write_all(b"T")?;
++        self.read_exact(out)
++    }
++}
++
++/// Where the device is in the DCD handshake.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++enum Xfer {
++    /// !HSHK deasserted, waiting for the Mac to assert HOST.
++    #[default]
++    Idle,
++    /// !HSHK asserted, waiting for the Mac to start sending (state 1).
++    CmdReady,
++    /// Receiving a command.
++    Receiving,
++    /// Command received and !HSHK released; process it when HOST drops.
++    CmdDone,
++    /// Response ready and !HSHK asserted; waiting for state 1.
++    RespReady,
++    /// Sending a response.
++    Sending,
++    /// Response sent and !HSHK released; waiting for HOST to drop.
++    SendDone,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++enum RxStage {
++    #[default]
++    Sync,
++    LenRx,
++    LenTx,
++    Groups,
++}
++
++/// The DCD chain: up to four units, each a slot on the FujiNet.
++pub struct DcdChain {
++    addr: Option<String>,
++    link: Option<Link>,
++    last_connect: Option<Instant>,
++    units: usize,
++
++    /// Position in the daisy chain; `units` means the chain has passed on
++    /// to the floppy drive behind it.
++    pub pos: usize,
++    phase: u8,
++    hshk: bool,
++    xfer: Xfer,
++
++    // Mac -> device
++    rx_stage: RxStage,
++    nrx: usize,
++    ntx: usize,
++    group: Vec<u8>,
++    groups_in: usize,
++    command: Vec<u8>,
++    write_lba: u32,
++
++    // device -> Mac
++    responses: VecDeque<Vec<u8>>,
++    resp_groups: Vec<[u8; 8]>,
++    resp_next: usize,
++    holdoff: bool,
++    tx: VecDeque<u8>,
++    out_byte: u8,
++    out_bits: u8,
++}
++
++impl Default for DcdChain {
++    fn default() -> Self {
++        Self::from_env()
++    }
++}
++
++impl DcdChain {
++    pub fn from_env() -> Self {
++        let addr = std::env::var("SNOW_FUJINET_DCD").ok().filter(|s| !s.is_empty());
++        let mut chain = Self {
++            addr,
++            link: None,
++            last_connect: None,
++            units: 0,
++            pos: 0,
++            phase: 2,
++            hshk: false,
++            xfer: Xfer::Idle,
++            rx_stage: RxStage::Sync,
++            nrx: 0,
++            ntx: 0,
++            group: Vec::with_capacity(8),
++            groups_in: 0,
++            command: Vec::new(),
++            write_lba: 0,
++            responses: VecDeque::new(),
++            resp_groups: Vec::new(),
++            resp_next: 0,
++            holdoff: false,
++            tx: VecDeque::new(),
++            out_byte: 0,
++            out_bits: 0,
++        };
++        if chain.addr.is_some() {
++            chain.connect();
++        }
++        chain
++    }
++
++    /// Number of DCD units currently in front of the floppy drive.
++    pub fn units(&self) -> usize {
++        self.units
++    }
++
++    fn connect(&mut self) {
++        let Some(addr) = self.addr.clone() else {
++            return;
++        };
++        self.last_connect = Some(Instant::now());
++        match Link::connect(&addr).and_then(|mut l| l.query_units().map(|n| (l, n))) {
++            Ok((link, n)) => {
++                self.units = n.min(MAX_UNITS);
++                self.link = Some(link);
++                info!("DCD: FujiNet at {} reports {} unit(s)", addr, self.units);
++            }
++            Err(e) => {
++                if self.units != 0 || self.link.is_some() {
++                    warn!("DCD: FujiNet at {} unavailable: {}", addr, e);
++                }
++                self.units = 0;
++                self.link = None;
++            }
++        }
++    }
++
++    fn drop_link(&mut self, e: std::io::Error) {
++        error!("DCD: FujiNet link failed: {}", e);
++        self.link = None;
++        self.units = 0;
++    }
++
++    /// Called now and then while no transfer is running: picks up unit count
++    /// changes and reconnects a lost link.
++    pub fn housekeeping(&mut self) {
++        if self.xfer != Xfer::Idle || self.addr.is_none() {
++            return;
++        }
++        match self.link.as_mut() {
++            Some(link) => match link.drain() {
++                Ok(Some(n)) => {
++                    let n = n.min(MAX_UNITS);
++                    if n != self.units {
++                        info!("DCD: {} unit(s) now in the chain", n);
++                        self.units = n;
++                    }
++                }
++                Ok(None) => (),
++                Err(e) => self.drop_link(e),
++            },
++            None => {
++                if self
++                    .last_connect
++                    .is_none_or(|t| t.elapsed() >= RECONNECT_INTERVAL)
++                {
++                    self.connect();
++                }
++            }
++        }
++    }
++
++    /// The RD line as seen through the IWM sense bit.
++    pub fn sense(&self) -> bool {
++        match self.phase {
++            // !HSHK: low (false) when asserted
++            2 | 3 => !self.hshk,
++            // Device detection: states 5, 6, 7 read low, high, high
++            5 => false,
++            6 | 7 => true,
++            _ => true,
++        }
++    }
++
++    /// Resets the device (RESET, or the chain being deselected).
++    pub fn reset(&mut self) {
++        self.hshk = false;
++        self.xfer = Xfer::Idle;
++        self.rx_stage = RxStage::Sync;
++        self.responses.clear();
++        self.resp_groups.clear();
++        self.tx.clear();
++        self.out_bits = 0;
++        self.holdoff = false;
++    }
++
++    /// The phase lines (CA2 CA1 CA0) changed while this chain is selected.
++    pub fn set_phase(&mut self, phase: u8) {
++        let prev = self.phase;
++        if phase == prev {
++            return;
++        }
++        self.phase = phase;
++
++        if phase == 4 {
++            self.reset();
++            return;
++        }
++
++        match (self.xfer, phase) {
++            // Mac asserts HOST to send a command.
++            (Xfer::Idle, 3) => {
++                self.rx_stage = RxStage::Sync;
++                self.group.clear();
++                self.groups_in = 0;
++                self.command.clear();
++                self.hshk = true;
++                self.xfer = Xfer::CmdReady;
++            }
++            (Xfer::CmdReady, 1) => self.xfer = Xfer::Receiving,
++            // Holdoff while receiving: the Mac finishes the group, then
++            // resumes with a sync byte.
++            (Xfer::Receiving, 0) => (),
++            (Xfer::Receiving, 1) if prev == 0 => self.rx_stage = RxStage::Sync,
++            // Transfer complete: release !HSHK so the Mac drops HOST.
++            (Xfer::Receiving, 3) => {
++                if self.groups_in < self.nrx {
++                    warn!(
++                        "DCD: command ended after {} of {} groups",
++                        self.groups_in, self.nrx
++                    );
++                }
++                self.hshk = false;
++                self.xfer = Xfer::CmdDone;
++            }
++            (Xfer::CmdDone, 2) => {
++                self.process_command();
++                self.next_response();
++            }
++            (Xfer::RespReady, 3) => (),
++            (Xfer::RespReady, 1) => {
++                self.xfer = Xfer::Sending;
++                self.holdoff = false;
++                self.tx.push_back(0xAA);
++            }
++            (Xfer::Sending, 0) => self.holdoff = true,
++            (Xfer::Sending, 1) if self.holdoff => {
++                self.holdoff = false;
++                self.tx.push_back(0xAA);
++            }
++            (Xfer::Sending | Xfer::SendDone, 3) => (),
++            (Xfer::SendDone, 2) => self.next_response(),
++            (x, p) if p == 2 && x != Xfer::Idle => {
++                debug!("DCD: HOST dropped in {:?}, back to idle", x);
++                self.reset();
++            }
++            _ => (),
++        }
++    }
++
++    /// A byte the Mac wrote through the IWM.
++    pub fn write_byte(&mut self, b: u8) {
++        if self.xfer != Xfer::Receiving {
++            return;
++        }
++        match self.rx_stage {
++            RxStage::Sync => {
++                if b == 0xAA {
++                    self.rx_stage = if self.command.is_empty() && self.groups_in == 0 {
++                        RxStage::LenRx
++                    } else {
++                        RxStage::Groups
++                    };
++                }
++            }
++            RxStage::LenRx => {
++                self.nrx = (b & 0x7F) as usize;
++                self.rx_stage = RxStage::LenTx;
++            }
++            RxStage::LenTx => {
++                self.ntx = (b & 0x7F) as usize;
++                self.rx_stage = RxStage::Groups;
++            }
++            RxStage::Groups => {
++                if self.groups_in >= self.nrx {
++                    return;
++                }
++                self.group.push(b);
++                if self.group.len() == 8 {
++                    // Mac -> device: the LSB byte comes first.
++                    let lsb = self.group[0];
++                    for j in 0..7 {
++                        self.command
++                            .push((self.group[1 + j] << 1) | ((lsb >> j) & 1));
++                    }
++                    self.group.clear();
++                    self.groups_in += 1;
++                }
++            }
++        }
++    }
++
++    /// Next bit on RD, one per bit cell.
++    pub fn next_bit(&mut self) -> bool {
++        if self.out_bits == 0 {
++            if self.tx.is_empty() && self.xfer == Xfer::Sending && !self.holdoff {
++                if self.resp_next < self.resp_groups.len() {
++                    self.tx.extend(self.resp_groups[self.resp_next]);
++                    self.resp_next += 1;
++                } else {
++                    // Everything sent: release !HSHK.
++                    self.hshk = false;
++                    self.xfer = Xfer::SendDone;
++                }
++            }
++            match self.tx.pop_front() {
++                Some(b) => {
++                    self.out_byte = b;
++                    self.out_bits = 8;
++                }
++                None => return false,
++            }
++        }
++        let bit = self.out_byte & 0x80 != 0;
++        self.out_byte <<= 1;
++        self.out_bits -= 1;
++        bit
++    }
++
++    fn next_response(&mut self) {
++        match self.responses.pop_front() {
++            Some(payload) => {
++                self.resp_groups = encode_groups(&payload, self.ntx);
++                self.resp_next = 0;
++                self.hshk = true;
++                self.xfer = Xfer::RespReady;
++            }
++            None => {
++                self.hshk = false;
++                self.xfer = Xfer::Idle;
++            }
++        }
++    }
++
++    fn process_command(&mut self) {
++        let cmd = std::mem::take(&mut self.command);
++        if cmd.is_empty() {
++            warn!("DCD: empty command");
++            return;
++        }
++        let sum = cmd.iter().fold(0u8, |a, b| a.wrapping_add(*b));
++        if sum != 0 {
++            warn!("DCD: command {:02X} checksum error", cmd[0]);
++            self.responses.push_back(finish(vec![0x7F, 0, 0, 0, 0, 0, 0]));
++            return;
++        }
++        let unit = self.pos.min(MAX_UNITS - 1);
++        let at = |i: usize| cmd.get(i).copied().unwrap_or(0);
++        let lba = ((at(2) as u32) << 16) | ((at(3) as u32) << 8) | at(4) as u32;
++
++        match cmd[0] {
++            0x00 => {
++                let count = at(1);
++                for i in 0..count {
++                    let mut block = [0u8; 512];
++                    let mut status = 0u8;
++                    if let Some(link) = self.link.as_mut() {
++                        if let Err(e) = link.read_block(unit, lba + i as u32, &mut block) {
++                            self.drop_link(e);
++                            status = 1;
++                        }
++                    } else {
++                        status = 1;
++                    }
++                    let mut r = vec![0u8; 539];
++                    r[0] = 0x80;
++                    r[1] = count - i;
++                    r[5] = status;
++                    r[26..538].copy_from_slice(&block);
++                    self.responses.push_back(finish(r));
++                }
++            }
++            0x01 | 0x02 | 0x41 | 0x42 => {
++                if cmd[0] & 0x40 == 0 {
++                    self.write_lba = lba;
++                }
++                let mut ok = false;
++                if cmd.len() >= 538 {
++                    if let Some(link) = self.link.as_mut() {
++                        match link.write_block(unit, self.write_lba, &cmd[26..538]) {
++                            Ok(w) => ok = w,
++                            Err(e) => self.drop_link(e),
++                        }
++                    }
++                } else {
++                    warn!("DCD: short write command ({} bytes)", cmd.len());
++                }
++                self.write_lba += 1;
++                let mut r = vec![0u8; 7];
++                r[0] = 0x80 | (cmd[0] & 0x03);
++                r[1] = at(1);
++                r[5] = if ok { 0 } else { 1 };
++                self.responses.push_back(finish(r));
++            }
++            0x03 => {
++                let mut status = [0u8; 336];
++                if let Some(link) = self.link.as_mut()
++                    && let Err(e) = link.status(unit, &mut status)
++                {
++                    self.drop_link(e);
++                }
++                let mut r = vec![0u8; 343];
++                r[0] = 0x83;
++                r[6..342].copy_from_slice(&status);
++                self.responses.push_back(finish(r));
++            }
++            0x04 => {
++                let mut r = vec![0u8; 49];
++                r[0] = 0x84;
++                r[6..19].copy_from_slice(b"FujiNet DCD  ");
++                r[19..22].copy_from_slice(&[0x00, 0x02, 0x10]);
++                r[22..24].copy_from_slice(&[0x33, 0x72]);
++                r[27..29].copy_from_slice(&[0x02, 0x14]);
++                self.responses.push_back(finish(r));
++            }
++            c @ (0x19 | 0x1A) => {
++                self.responses.push_back(finish(vec![0x80 | c, 0, 0, 0, 0, 0, 0]));
++            }
++            c => {
++                warn!("DCD: unsupported command {:02X}", c);
++                self.responses.push_back(finish(vec![0x80 | c, 0, 0, 0, 0, 1, 0]));
++            }
++        }
++    }
++}
++
++/// Sets the checksum (last byte) so the payload sums to zero.
++fn finish(mut payload: Vec<u8>) -> Vec<u8> {
++    let n = payload.len() - 1;
++    let sum = payload[..n].iter().fold(0u8, |a, b| a.wrapping_add(*b));
++    payload[n] = sum.wrapping_neg();
++    payload
++}
++
++/// 7-to-8 encoding for device -> Mac: seven shifted bytes, then the LSBs.
++fn encode_groups(payload: &[u8], ntx: usize) -> Vec<[u8; 8]> {
++    let groups = if ntx == 0 { payload.len().div_ceil(7) } else { ntx };
++    let mut out = Vec::with_capacity(groups);
++    for g in 0..groups {
++        let mut enc = [0u8; 8];
++        let mut lsb = 0u8;
++        for j in 0..7 {
++            let b = payload.get(g * 7 + j).copied().unwrap_or(0);
++            enc[j] = (b >> 1) | 0x80;
++            lsb |= (b & 1) << j;
++        }
++        enc[7] = lsb | 0x80;
++        out.push(enc);
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn chain() -> DcdChain {
++        let mut c = DcdChain::from_env();
++        c.addr = None;
++        c.units = 1;
++        c
++    }
++
++    /// Encode a Mac -> device transfer the way the Mac does (LSBs first).
++    fn mac_encode(payload: &[u8], ntx: u8) -> Vec<u8> {
++        let groups = payload.len().div_ceil(7);
++        let mut out = vec![0xAA, 0x80 | groups as u8, 0x80 | ntx];
++        for g in 0..groups {
++            let mut lsb = 0u8;
++            let mut bytes = Vec::new();
++            for j in 0..7 {
++                let b = payload.get(g * 7 + j).copied().unwrap_or(0);
++                lsb |= (b & 1) << j;
++                bytes.push((b >> 1) | 0x80);
++            }
++            out.push(lsb | 0x80);
++            out.extend(bytes);
++        }
++        out
++    }
++
++    fn decode_response(bytes: &[u8]) -> Vec<u8> {
++        assert_eq!(bytes[0], 0xAA);
++        let mut out = Vec::new();
++        for g in bytes[1..].chunks(8) {
++            let lsb = g[7];
++            for j in 0..7 {
++                out.push((g[j] << 1) | ((lsb >> j) & 1));
++            }
++        }
++        out
++    }
++
++    #[test]
++    fn id_command_round_trip() {
++        let mut c = chain();
++        // Idle -> HOST
++        c.set_phase(3);
++        assert!(c.hshk && !c.sense());
++        c.set_phase(1);
++        for b in mac_encode(&finish(vec![0x04, 0, 0, 0, 0, 0, 0]), 7) {
++            c.write_byte(b);
++        }
++        c.set_phase(3);
++        assert!(!c.hshk && c.sense());
++        c.set_phase(2);
++        assert!(c.hshk, "response ready");
++        c.set_phase(3);
++        c.set_phase(1);
++
++        let mut bytes = Vec::new();
++        let mut cur = 0u8;
++        let mut n = 0;
++        for _ in 0..(8 * 8 * 16) {
++            cur = (cur << 1) | c.next_bit() as u8;
++            if cur & 0x80 != 0 {
++                bytes.push(cur);
++                cur = 0;
++                n += 1;
++            }
++            if c.xfer == Xfer::SendDone && c.out_bits == 0 {
++                break;
++            }
++        }
++        assert!(n > 0);
++        let payload = decode_response(&bytes);
++        assert_eq!(payload[0], 0x84);
++        assert_eq!(&payload[6..13], b"FujiNet");
++        assert_eq!(payload[..49].iter().fold(0u8, |a, b| a.wrapping_add(*b)), 0);
++        assert!(!c.hshk);
++        c.set_phase(3);
++        c.set_phase(2);
++        assert_eq!(c.xfer, Xfer::Idle);
++    }
++}
+diff --git a/core/src/mac/swim/iwm.rs b/core/src/mac/swim/iwm.rs
+index 13350be..d098b9f 100644
+--- a/core/src/mac/swim/iwm.rs
++++ b/core/src/mac/swim/iwm.rs
+@@ -93,6 +93,9 @@ bitfield! {
+ impl Swim {
+     /// A memory-mapped I/O address was accessed
+     pub(super) fn iwm_access(&mut self, offset: Address) {
++        let ext_enabled = self.enable && self.extdrive;
++        let dcd = self.dcd_selected();
++
+         match (offset >> 9) & 0x0F {
+             0 => self.ca0 = false,
+             1 => self.ca0 = true,
+@@ -101,6 +104,14 @@ impl Swim {
+             4 => self.ca2 = false,
+             5 => self.ca2 = true,
+             6 => self.lstrb = false,
++            7 if dcd => {
++                // CA3 pulse: this DCD passes !ENBL on down the daisy chain.
++                if !self.lstrb {
++                    self.dcd.reset();
++                    self.dcd.pos += 1;
++                }
++                self.lstrb = true;
++            }
+             7 => {
+                 self.lstrb = true;
+ 
+@@ -124,6 +135,16 @@ impl Swim {
+             15 => self.q7 = true,
+             _ => (),
+         }
++
++        // !ENBL2 reasserted: the chain starts again at its first device.
++        if !ext_enabled && self.enable && self.extdrive {
++            self.dcd.pos = 0;
++            self.dcd.reset();
++        }
++        if self.dcd_selected() {
++            let phase = (u8::from(self.ca2) << 2) | (u8::from(self.ca1) << 1) | u8::from(self.ca0);
++            self.dcd.set_phase(phase);
++        }
+     }
+ 
+     /// Read on the bus
+@@ -143,9 +164,12 @@ impl Swim {
+             }
+             (true, false) => {
+                 // Read status register
+-                let sense = self
+-                    .get_selected_drive()
+-                    .read_sense(self.get_selected_drive_reg_u8());
++                let sense = if self.dcd_selected() {
++                    self.dcd.sense()
++                } else {
++                    self.get_selected_drive()
++                        .read_sense(self.get_selected_drive_reg_u8())
++                };
+                 self.iwm_status.set_sense(sense);
+                 self.iwm_status.set_mode_low(self.iwm_mode.mode_low());
+                 self.iwm_status.set_enable(self.enable);
+@@ -363,6 +387,32 @@ impl Swim {
+         Ok(())
+     }
+ 
++    /// Moves data between the IWM and a DCD unit, one bit cell at a time.
++    /// Unlike a floppy there is no weak-bit noise: an idle RD line reads 0.
++    pub(super) fn dcd_tick(&mut self, ticks: Ticks) {
++        self.bit_cycles += ticks;
++        while self.bit_cycles >= super::dcd::DCD_TICKS_PER_BIT {
++            self.bit_cycles -= super::dcd::DCD_TICKS_PER_BIT;
++
++            let bit = self.dcd.next_bit();
++            self.shdata = (self.shdata << 1) | u8::from(bit);
++            if self.shdata & 0x80 != 0 {
++                self.datareg = self.shdata;
++                self.shdata = 0;
++            }
++
++            if self.write_pos == 0
++                && let Some(v) = self.write_buffer.take()
++            {
++                self.write_pos = 8;
++                self.dcd.write_byte(v);
++            }
++            if self.write_pos > 0 {
++                self.write_pos -= 1;
++            }
++        }
++    }
++
+     pub(super) fn iwm_tick(&mut self, ticks: Ticks) -> Result<()> {
+         match self.get_selected_drive().floppy.get_track_type(
+             self.get_active_head(),
+diff --git a/core/src/mac/swim/mod.rs b/core/src/mac/swim/mod.rs
+index 6e92213..4cf3f51 100644
+--- a/core/src/mac/swim/mod.rs
++++ b/core/src/mac/swim/mod.rs
+@@ -3,6 +3,7 @@
+ //! Floppy drive controller consisting of two different controllers:
+ //! Integrated Wozniak Machine, Integrated Sander Machine.
+ 
++pub mod dcd;
+ pub mod drive;
+ pub mod ism;
+ pub mod iwm;
+@@ -143,6 +144,12 @@ pub struct Swim {
+ 
+     pub(crate) drives: [FloppyDrive; 3],
+ 
++    /// DCD (HD20) chain on the external port, served by a FujiNet.
++    #[serde(skip)]
++    pub(crate) dcd: dcd::DcdChain,
++    #[serde(skip)]
++    dcd_housekeeping: Ticks,
++
+     pub dbg_pc: u32,
+     pub dbg_break: LatchingEvent,
+ }
+@@ -201,11 +208,20 @@ impl Swim {
+             ism_write_prev_bit: false,
+ 
+             enable: false,
++            dcd: dcd::DcdChain::from_env(),
++            dcd_housekeeping: 0,
+             dbg_pc: 0,
+             dbg_break: LatchingEvent::default(),
+         }
+     }
+ 
++    /// True while the Mac is talking to a DCD unit rather than a floppy
++    /// drive: IWM mode, !ENBL2 asserted and the daisy chain not yet passed
++    /// on to the drive behind it.
++    pub(crate) fn dcd_selected(&self) -> bool {
++        self.mode == SwimMode::Iwm && self.enable && self.extdrive && self.dcd.pos < self.dcd.units()
++    }
++
+     fn get_selected_drive_idx(&self) -> usize {
+         if self.mode == SwimMode::Iwm {
+             if self.extdrive {
+@@ -326,6 +342,18 @@ impl Tickable for Swim {
+             self.get_selected_drive_mut().ejecting = None;
+         }
+ 
++        if self.dcd_selected() {
++            self.dcd_tick(ticks);
++            return Ok(ticks);
++        }
++
++        // Pick up FujiNet unit changes (and reconnect) about every 100 ms.
++        self.dcd_housekeeping += ticks;
++        if self.dcd_housekeeping >= 800_000 {
++            self.dcd_housekeeping = 0;
++            self.dcd.housekeeping();
++        }
++
+         if self.get_selected_drive().is_running() {
+             // Advance read/write operation
+             match self.mode {
+diff --git a/testrunner/src/bin/fnrun/main.rs b/testrunner/src/bin/fnrun/main.rs
+new file mode 100644
+index 0000000..cd63d38
+--- /dev/null
++++ b/testrunner/src/bin/fnrun/main.rs
+@@ -0,0 +1,202 @@
++//! Scripted headless runner: boots a Mac, drives the mouse and keyboard
++//! from a script and saves screenshots. Used to test the FujiNet DCD chain
++//! (SNOW_FUJINET_DCD) without a display.
++//!
++//! Script, one command per line (# comments):
++//!   rom <file>            model is detected from the ROM
++//!   floppy <drive> <file>
++//!   run <seconds>         run this much emulated time
++//!   shot <file.png>
++//!   move <x> <y>          absolute pointer position
++//!   down | up | click | dclick
++//!   key <hex> [cmd]       AEK scancode, optionally with Command held
++//!   type <text>           letters, digits, space, '.', ':' and '/'
++//!   until <seconds> <file.png>  like run, but stop early when the screen
++//!                         stops changing for a second (then shoot)
++
++use std::fs::{self, File};
++
++use anyhow::{Context, Result, bail};
++use snow_core::emulator::Emulator;
++use snow_core::emulator::comm::{EmulatorCommand, EmulatorSpeed};
++use snow_core::keymap::{KeyEvent, Keymap};
++use snow_core::mac::MacModel;
++use snow_core::tickable::Tickable;
++
++const PLUS_HZ: f64 = 7_833_600.0;
++
++struct Runner {
++    emu: Emulator,
++    frames: std::sync::Arc<std::sync::Mutex<Option<snow_core::renderer::DisplayBuffer>>>,
++    cmd: snow_core::emulator::comm::EmulatorCommandSender,
++    events: snow_core::emulator::comm::EmulatorEventReceiver,
++    last: Option<(u16, u16, Vec<u8>)>,
++}
++
++impl Runner {
++    fn pump(&mut self) -> bool {
++        // The event channel is bounded: an undrained one stalls the emulator.
++        while self.events.try_recv().is_ok() {}
++        let mut changed = false;
++        if let Some(buf) = self.frames.lock().unwrap().take() {
++            let (w, h) = (buf.width(), buf.height());
++            let data = buf.into_inner();
++            changed = self.last.as_ref().is_none_or(|l| l.2 != data);
++            self.last = Some((w, h, data));
++        }
++        changed
++    }
++
++    fn run(&mut self, secs: f64) -> Result<()> {
++        let target = self.emu.get_cycles() + (secs * PLUS_HZ) as u64;
++        while self.emu.get_cycles() < target {
++            self.emu.tick(1, ())?;
++            self.pump();
++        }
++        Ok(())
++    }
++
++    fn until_idle(&mut self, secs: f64) -> Result<()> {
++        let start = self.emu.get_cycles();
++        let target = start + (secs * PLUS_HZ) as u64;
++        let mut last_change = start;
++        while self.emu.get_cycles() < target {
++            self.emu.tick(1, ())?;
++            if self.pump() {
++                last_change = self.emu.get_cycles();
++            }
++            if self.emu.get_cycles() - last_change > PLUS_HZ as u64 * 2 {
++                break;
++            }
++        }
++        Ok(())
++    }
++
++    fn shot(&mut self, path: &str) -> Result<()> {
++        self.pump();
++        let Some((w, h, data)) = self.last.as_ref() else {
++            bail!("no frame yet");
++        };
++        let mut enc = png::Encoder::new(File::create(path)?, *w as u32, *h as u32);
++        enc.set_color(png::ColorType::Rgba);
++        enc.set_depth(png::BitDepth::Eight);
++        enc.write_header()?.write_image_data(data)?;
++        println!("shot {}", path);
++        Ok(())
++    }
++
++    fn send(&mut self, c: EmulatorCommand) -> Result<()> {
++        self.cmd.send(c)?;
++        // Let the emulator loop pick the command up.
++        self.run(0.02)
++    }
++
++    fn button(&mut self, down: bool) -> Result<()> {
++        self.send(EmulatorCommand::MouseUpdateRelative { relx: 0, rely: 0, btn: Some(down) })
++    }
++
++    fn key(&mut self, sc: u8, cmd: bool) -> Result<()> {
++        if cmd {
++            self.send(EmulatorCommand::KeyEvent(KeyEvent::KeyDown(0x37, Keymap::AekM0115)))?;
++        }
++        self.send(EmulatorCommand::KeyEvent(KeyEvent::KeyDown(sc, Keymap::AekM0115)))?;
++        self.send(EmulatorCommand::KeyEvent(KeyEvent::KeyUp(sc, Keymap::AekM0115)))?;
++        if cmd {
++            self.send(EmulatorCommand::KeyEvent(KeyEvent::KeyUp(0x37, Keymap::AekM0115)))?;
++        }
++        Ok(())
++    }
++}
++
++fn scancode(c: char) -> Option<(u8, bool)> {
++    let letters = "asdfhgzxcv_bqweryt123465=97-80]ou[ip_lj'k;\\,/nm.";
++    if let Some(i) = letters.find(c.to_ascii_lowercase()) {
++        if c != '_' {
++            return Some((i as u8, c.is_ascii_uppercase()));
++        }
++    }
++    Some(match c {
++        ' ' => (0x31, false),
++        ':' => (0x29, true),
++        '\n' => (0x24, false),
++        _ => return None,
++    })
++}
++
++fn main() -> Result<()> {
++    env_logger::Builder::from_default_env()
++        .filter_level(log::LevelFilter::Info)
++        .init();
++    let script_path = std::env::args().nth(1).context("usage: fnrun <script>")?;
++    let script = fs::read_to_string(&script_path)?;
++    let mut lines = script.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
++
++    let first = lines.next().context("empty script")?;
++    let rom_path = first.strip_prefix("rom ").context("script must start with 'rom <file>'")?;
++    let rom = fs::read(rom_path)?;
++    let model = MacModel::detect_from_rom(&rom).context("unknown ROM")?;
++    let (emu, frames) = Emulator::new(&rom, &[], model)?;
++    let cmd = emu.create_cmd_sender();
++    let events = emu.create_event_recv();
++    let mut r = Runner { emu, frames, cmd, events, last: None };
++
++    let mut started = false;
++    for line in lines {
++        let (op, arg) = line.split_once(' ').unwrap_or((line, ""));
++        match op {
++            "floppy" => {
++                let (d, f) = arg.split_once(' ').context("floppy <drive> <file>")?;
++                r.cmd.send(EmulatorCommand::InsertFloppy(d.parse()?, f.to_string(), false))?;
++            }
++            "run" => {
++                if !started {
++                    started = true;
++                    r.cmd.send(EmulatorCommand::Run)?;
++                    r.cmd.send(EmulatorCommand::SetSpeed(EmulatorSpeed::Uncapped))?;
++                }
++                r.run(arg.parse()?)?;
++            }
++            "until" => {
++                let (s, f) = arg.split_once(' ').context("until <secs> <file>")?;
++                r.until_idle(s.parse()?)?;
++                r.shot(f)?;
++            }
++            "shot" => r.shot(arg)?,
++            "move" => {
++                let (x, y) = arg.split_once(' ').context("move <x> <y>")?;
++                r.send(EmulatorCommand::MouseUpdateAbsolute { x: x.parse()?, y: y.parse()? })?;
++            }
++            "down" => r.button(true)?,
++            "up" => r.button(false)?,
++            "click" => {
++                r.button(true)?;
++                r.button(false)?;
++            }
++            "dclick" => {
++                r.button(true)?;
++                r.button(false)?;
++                r.button(true)?;
++                r.button(false)?;
++            }
++            "key" => {
++                let mut it = arg.split_whitespace();
++                let sc = u8::from_str_radix(it.next().context("key <hex>")?, 16)?;
++                r.key(sc, it.next() == Some("cmd"))?;
++            }
++            "type" => {
++                for c in arg.chars() {
++                    let (sc, shift) = scancode(c).with_context(|| format!("cannot type {:?}", c))?;
++                    if shift {
++                        r.send(EmulatorCommand::KeyEvent(KeyEvent::KeyDown(0x38, Keymap::AekM0115)))?;
++                    }
++                    r.key(sc, false)?;
++                    if shift {
++                        r.send(EmulatorCommand::KeyEvent(KeyEvent::KeyUp(0x38, Keymap::AekM0115)))?;
++                    }
++                }
++            }
++            _ => bail!("unknown command: {}", line),
++        }
++    }
++    Ok(())
++}
+-- 
+2.51.0
+

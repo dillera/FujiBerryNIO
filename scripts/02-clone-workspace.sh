@@ -32,6 +32,8 @@ PATCHES=(
   "0003-driver-darwin-mkdtemp.patch:repos/fujinet-nio-driver"
   "0004-driver-nio-dosbase-null.patch:repos/fujinet-nio-driver"
   "0005-fujinet-nio-tcp-connect-errno.patch:repos/fujinet-nio"
+  "0006-fujinet-nio-mac-floppy-bus.patch:repos/fujinet-nio"
+  "0007-fujinet-nio-lib-mac68k.patch:repos/fujinet-nio-lib"
 )
 
 for entry in "${PATCHES[@]}"; do

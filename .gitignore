@@ -7,3 +7,8 @@ toolchain-src/
 logs/*.log
 logs/shots/
 tools/*/build/
+
+# Mac: NIO run area (disk images, NIO state) and ROMs
+mac/run/
+mac/**/build/
+*.rom
