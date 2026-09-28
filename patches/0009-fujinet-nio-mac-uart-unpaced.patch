@@ -1,0 +1,20 @@
+diff --git a/src/platform/esp32/channel_factory.cpp b/src/platform/esp32/channel_factory.cpp
+index 5d9a4fb..3fdf46a 100644
+--- a/src/platform/esp32/channel_factory.cpp
++++ b/src/platform/esp32/channel_factory.cpp
+@@ -54,8 +54,14 @@ create_channel_for_profile(const build::BuildProfile& profile, const config::Fuj
+     case ChannelKind::UartGpio: {
+         auto uart = config.channel.uart;
+         if (profile.primaryTransport == build::TransportKind::MacFloppy) {
+-            // The Mac board's Pico link runs at a fixed 2 Mbaud.
++            // The Mac board's Pico link runs at a fixed 2 Mbaud, unpaced:
++            // the Pico reads blocks at full speed, and the default chunk
++            // pacing (16 bytes, then 2 ms) made each block take 64 ms.
+             uart.baudRate = 2000000;
++            uart.txGapUs = 0;
++            uart.txByteGapUs = 0;
++            uart.txChunkSize = 0;
++            uart.txChunkGapUs = 0;
+         }
+         FN_ELOG("Using UartChannel for UartGpio (baud=%u, data_bits=%d)",
+                 static_cast<unsigned>(uart.baudRate), uart.dataBits);

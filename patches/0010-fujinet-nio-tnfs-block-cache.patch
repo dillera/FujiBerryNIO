@@ -1,0 +1,857 @@
+diff --git a/include/fujinet/tnfs/tnfs_client_common.h b/include/fujinet/tnfs/tnfs_client_common.h
+index 484d6dc..5005008 100644
+--- a/include/fujinet/tnfs/tnfs_client_common.h
++++ b/include/fujinet/tnfs/tnfs_client_common.h
+@@ -4,6 +4,7 @@
+ #include "fujinet/io/core/channel.h"
+ #include "fujinet/core/logging.h"
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstring>
+ #include <memory>
+@@ -16,9 +17,11 @@ static constexpr const char* TAG = "tnfs";
+ 
+ class CommonTnfsClient : public ITnfsClient {
+ public:
+-    CommonTnfsClient(std::unique_ptr<fujinet::io::Channel> channel, const char* transportName)
++    CommonTnfsClient(std::unique_ptr<fujinet::io::Channel> channel, const char* transportName,
++                     bool parallelReads = false)
+         : _channel(std::move(channel))
+         , _transportName(transportName)
++        , _parallelReads(parallelReads)
+     {
+         FN_LOGI(TAG, "%s TNFS client created", _transportName);
+     }
+@@ -309,6 +312,65 @@ public:
+         return pos;
+     }
+ 
++    bool supports_parallel_reads() const override { return _parallelReads; }
++
++    void read_parallel(std::vector<ReadAt>& reads) override
++    {
++        for (auto& r : reads) {
++            r.got = 0;
++        }
++        if (_sessionId == 0 || reads.empty() || !_parallelReads) {
++            return;
++        }
++
++        // Seek phase. A seek is idempotent, so a lost one is sent again.
++        std::vector<TnfsPacket> pkts(reads.size());
++        for (std::size_t i = 0; i < reads.size(); ++i) {
++            fill_session_header(pkts[i], CMD_LSEEK);
++            pkts[i].payload[0] = static_cast<std::uint8_t>(reads[i].fileHandle);
++            pkts[i].payload[1] = 0; // SEEK_SET
++            pkts[i].payload[2] = static_cast<std::uint8_t>(reads[i].offset & 0xFFU);
++            pkts[i].payload[3] = static_cast<std::uint8_t>((reads[i].offset >> 8) & 0xFFU);
++            pkts[i].payload[4] = static_cast<std::uint8_t>((reads[i].offset >> 16) & 0xFFU);
++            pkts[i].payload[5] = static_cast<std::uint8_t>((reads[i].offset >> 24) & 0xFFU);
++        }
++        std::vector<bool> ok = exchange_all(pkts, std::vector<std::size_t>(reads.size(), 6), kMaxAttempts);
++
++        // Read phase, for the handles that are in place. Sent once: a read
++        // whose reply was lost has moved its handle, so sending it again
++        // would return the wrong block.
++        std::vector<std::size_t> which;
++        std::vector<TnfsPacket> readPkts;
++        for (std::size_t i = 0; i < reads.size(); ++i) {
++            if (!ok[i] || pkts[i].payload[0] != RESULT_SUCCESS) {
++                continue;
++            }
++            const std::size_t req = std::min<std::size_t>(reads[i].bytes, 512);
++            TnfsPacket pkt{};
++            fill_session_header(pkt, CMD_READ);
++            pkt.payload[0] = static_cast<std::uint8_t>(reads[i].fileHandle);
++            pkt.payload[1] = static_cast<std::uint8_t>(req & 0xFFU);
++            pkt.payload[2] = static_cast<std::uint8_t>((req >> 8) & 0xFFU);
++            which.push_back(i);
++            readPkts.push_back(pkt);
++        }
++        if (readPkts.empty()) {
++            return;
++        }
++        ok = exchange_all(readPkts, std::vector<std::size_t>(readPkts.size(), 3), 1);
++        for (std::size_t k = 0; k < which.size(); ++k) {
++            ReadAt& r = reads[which[k]];
++            const TnfsPacket& reply = readPkts[k];
++            if (!ok[k] || reply.payload[0] != RESULT_SUCCESS) {
++                continue;
++            }
++            const std::size_t req = std::min<std::size_t>(r.bytes, 512);
++            const std::size_t got = std::min<std::size_t>(read_u16le(reply.payload[1], reply.payload[2]), req);
++            std::memcpy(r.dst, reply.payload + 3, got);
++            r.got = got;
++        }
++    }
++
+ private:
+     static std::uint16_t read_u16le(std::uint8_t lo, std::uint8_t hi)
+     {
+@@ -396,13 +458,43 @@ private:
+         return true;
+     }
+ 
+-    bool send_and_receive(TnfsPacket& pkt, std::size_t payloadSize)
++    static constexpr std::chrono::milliseconds kTimeoutPerAttempt{1500};
++    static constexpr int kMaxAttempts = 3;
++    static constexpr std::size_t kMinResponseSize = 5;
++
++    // One reply, or false at the deadline.
++    bool receive(TnfsPacket& response, std::chrono::steady_clock::time_point deadline)
+     {
+-        static constexpr std::chrono::milliseconds kTimeoutPerAttempt(1500);
+-        static constexpr std::chrono::milliseconds kPollDelay(10);
+-        static constexpr int kMaxAttempts = 3;
+-        static constexpr std::size_t kMinResponseSize = 5;
++        while (true) {
++            const std::size_t bytesRead =
++                _channel->read(reinterpret_cast<std::uint8_t*>(&response), sizeof(response));
++            if (bytesRead >= kMinResponseSize) {
++                return true;
++            }
++            const auto now = std::chrono::steady_clock::now();
++            if (now >= deadline) {
++                return false;
++            }
++            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
++            if (_channel->supports_readable_wait()) {
++                _channel->wait_for_readable(std::min(left, std::chrono::milliseconds(50)));
++            } else {
++                std::this_thread::sleep_for(std::min(left, std::chrono::milliseconds(10)));
++            }
++        }
++    }
++
++    bool is_reply_to(const TnfsPacket& response, std::uint8_t seq) const
++    {
++        if (response.sequenceNum != seq) {
++            return false;
++        }
++        return _sessionId == 0 ||
++               read_u16le(response.sessionIdL, response.sessionIdH) == _sessionId;
++    }
+ 
++    bool send_and_receive(TnfsPacket& pkt, std::size_t payloadSize)
++    {
+         const std::uint8_t expectedSeq = pkt.sequenceNum;
+         std::vector<std::uint8_t> tx(4 + payloadSize);
+         std::memcpy(tx.data(), &pkt, tx.size());
+@@ -411,36 +503,59 @@ private:
+             _channel->write(tx.data(), tx.size());
+             const auto deadline = std::chrono::steady_clock::now() + kTimeoutPerAttempt;
+ 
+-            while (std::chrono::steady_clock::now() < deadline) {
+-                TnfsPacket response{};
+-                const std::size_t bytesRead = _channel->read(reinterpret_cast<std::uint8_t*>(&response), sizeof(response));
+-                if (bytesRead < kMinResponseSize) {
+-                    std::this_thread::sleep_for(kPollDelay);
+-                    continue;
++            TnfsPacket response{};
++            while (receive(response, deadline)) {
++                if (is_reply_to(response, expectedSeq)) {
++                    pkt = response;
++                    return true;
+                 }
++            }
++        }
++
++        FN_LOGE(TAG, "%s TNFS timeout for command 0x%02X", _transportName, static_cast<unsigned>(pkt.command));
++        return false;
++    }
+ 
+-                if (response.sequenceNum != expectedSeq) {
+-                    continue;
++    // Send every packet at once and collect the replies, which replace the
++    // packets. Unanswered packets are sent again, up to `attempts` times in
++    // all. Returns which packets got a reply.
++    std::vector<bool> exchange_all(std::vector<TnfsPacket>& pkts, const std::vector<std::size_t>& payloadSizes,
++                                   int attempts)
++    {
++        std::vector<bool> done(pkts.size(), false);
++        std::size_t left = pkts.size();
++        const std::vector<TnfsPacket> sent = pkts;
++
++        for (int attempt = 0; attempt < attempts && left > 0; ++attempt) {
++            for (std::size_t i = 0; i < sent.size(); ++i) {
++                if (!done[i]) {
++                    _channel->write(reinterpret_cast<const std::uint8_t*>(&sent[i]), 4 + payloadSizes[i]);
+                 }
+-                if (_sessionId != 0) {
+-                    const std::uint16_t respSession = read_u16le(response.sessionIdL, response.sessionIdH);
+-                    if (respSession != _sessionId) {
+-                        continue;
++            }
++            const auto deadline = std::chrono::steady_clock::now() + kTimeoutPerAttempt;
++            TnfsPacket response{};
++            while (left > 0 && receive(response, deadline)) {
++                for (std::size_t i = 0; i < sent.size(); ++i) {
++                    if (!done[i] && is_reply_to(response, sent[i].sequenceNum)) {
++                        pkts[i] = response;
++                        done[i] = true;
++                        --left;
++                        break;
+                     }
+                 }
+-
+-                pkt = response;
+-                return true;
+             }
+         }
+-
+-        FN_LOGE(TAG, "%s TNFS timeout for command 0x%02X", _transportName, static_cast<unsigned>(pkt.command));
+-        return false;
++        if (left > 0) {
++            FN_LOGW(TAG, "%s TNFS: %u of %u parallel replies missing", _transportName,
++                    static_cast<unsigned>(left), static_cast<unsigned>(pkts.size()));
++        }
++        return done;
+     }
+ 
+ private:
+     std::unique_ptr<fujinet::io::Channel> _channel;
+     const char* _transportName;
++    bool _parallelReads{false};
+     std::uint16_t _sessionId{0};
+     std::uint8_t _sequenceNum{0};
+ };
+diff --git a/include/fujinet/tnfs/tnfs_protocol.h b/include/fujinet/tnfs/tnfs_protocol.h
+index 5f88e3b..d1441ef 100644
+--- a/include/fujinet/tnfs/tnfs_protocol.h
++++ b/include/fujinet/tnfs/tnfs_protocol.h
+@@ -128,6 +128,32 @@ public:
+     virtual std::size_t write(int fileHandle, const void* buffer, std::size_t bytes) = 0;
+     virtual bool seek(int fileHandle, uint32_t offset) = 0;
+     virtual uint32_t tell(int fileHandle) = 0;
++
++    // One read of a batch: `bytes` (at most 512) at `offset` of `fileHandle`.
++    struct ReadAt {
++        int fileHandle{-1};
++        uint32_t offset{0};
++        uint8_t* dst{nullptr};
++        std::size_t bytes{0};
++        std::size_t got{0}; // filled in; 0 when this read failed
++    };
++
++    // Whether read_parallel() can keep several requests in flight. A TNFS
++    // server handles each UDP datagram on its own, so reads on different
++    // handles can overlap; over TCP a server may drop requests that arrive
++    // in one segment.
++    virtual bool supports_parallel_reads() const { return false; }
++
++    // Seek every handle, then read every handle, with all requests of each
++    // phase in flight together: about two round trips for the whole batch.
++    // Every entry needs its own handle. Afterwards the handles' positions
++    // are unknown to the caller.
++    virtual void read_parallel(std::vector<ReadAt>& reads)
++    {
++        for (auto& r : reads) {
++            r.got = 0;
++        }
++    }
+ };
+ 
+ std::unique_ptr<ITnfsClient> make_udp_tnfs_client(std::unique_ptr<fujinet::io::Channel> channel);
+diff --git a/src/lib/fs/tnfs_filesystem.cpp b/src/lib/fs/tnfs_filesystem.cpp
+index f18e726..c90a89b 100644
+--- a/src/lib/fs/tnfs_filesystem.cpp
++++ b/src/lib/fs/tnfs_filesystem.cpp
+@@ -4,6 +4,7 @@
+ #include "fujinet/fs/uri_parser.h"
+ #include "fujinet/core/logging.h"
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstring>
+ #include <cstdint>
+@@ -12,22 +13,51 @@
+ #include <memory>
+ #include <tuple>
+ #include <utility>
++#include <vector>
+ 
+ namespace fujinet::fs {
+ 
+ static constexpr const char* TAG = "tnfs_fs";
+ 
++class TnfsFile;
++
++// The open files of one TNFS session. A server limits a session's open files
++// (16 for tnfsd), so read-ahead handles are given back when a new file
++// cannot be opened.
++struct TnfsOpenFiles {
++    std::vector<TnfsFile*> files;
++};
++
++// A TNFS file. Every request is a network round trip, so for disk images,
++// which are read in whole 512-byte blocks, it keeps a small block cache and
++// reads ahead: a missed block is fetched with the blocks after it, over
++// extra read-only handles on the same file, in parallel (about two round
++// trips for the lot). Writes go straight to the server and update the cache.
++// Seeks are deferred until the server needs the position. Another client
++// writing the same file is not seen while a block is cached.
+ class TnfsFile final : public IFile {
+ public:
+-    TnfsFile(std::shared_ptr<tnfs::ITnfsClient> client, int fileHandle)
++    static constexpr std::size_t kBlock = 512;
++    static constexpr std::size_t kCacheBlocks = 64;  // 32 KB, allocated on first block read
++    static constexpr std::size_t kReadAhead = 8;     // blocks per parallel fetch
++    static constexpr std::uint64_t kUnknown = ~std::uint64_t{0};
++
++    TnfsFile(std::shared_ptr<tnfs::ITnfsClient> client, int fileHandle, std::string path, bool cacheable,
++             std::shared_ptr<TnfsOpenFiles> openFiles)
+         : _client(std::move(client))
+         , _fileHandle(fileHandle)
+-        , _position(0)
++        , _path(std::move(path))
++        , _cacheable(cacheable)
++        , _openFiles(std::move(openFiles))
+     {
++        _openFiles->files.push_back(this);
+         FN_LOGD(TAG, "File handle %d created", fileHandle);
+     }
+ 
+     ~TnfsFile() override {
++        auto& files = _openFiles->files;
++        files.erase(std::remove(files.begin(), files.end(), this), files.end());
++        drop_lanes();
+         if (_fileHandle != -1) {
+             _client->close(_fileHandle);
+             FN_LOGD(TAG, "File handle %d closed", _fileHandle);
+@@ -35,23 +65,52 @@ public:
+     }
+ 
+     std::size_t read(void* dst, std::size_t maxBytes) override {
+-        std::size_t bytesRead = _client->read(_fileHandle, dst, maxBytes);
++        auto* out = static_cast<std::uint8_t*>(dst);
++        if (_cacheable && maxBytes == kBlock && _position % kBlock == 0) {
++            if (cache_get(_position, out) || (read_ahead(_position) && cache_get(_position, out))) {
++                _position += kBlock;
++                return kBlock;
++            }
++        }
++
++        if (!sync_position()) {
++            return 0;
++        }
++        const std::size_t bytesRead = _client->read(_fileHandle, out, maxBytes);
++        if (bytesRead == std::min<std::size_t>(maxBytes, kBlock)) {
++            _serverPos += bytesRead;
++        } else {
++            _serverPos = kUnknown;
++        }
++        if (_cacheable && bytesRead == kBlock && _position % kBlock == 0) {
++            cache_put(_position, out);
++        }
+         _position += bytesRead;
+         return bytesRead;
+     }
+ 
+     std::size_t write(const void* src, std::size_t bytes) override {
+-        std::size_t bytesWritten = _client->write(_fileHandle, src, bytes);
++        const auto* in = static_cast<const std::uint8_t*>(src);
++        if (!sync_position()) {
++            return 0;
++        }
++        const std::size_t bytesWritten = _client->write(_fileHandle, in, bytes);
++        if (bytesWritten == std::min<std::size_t>(bytes, kBlock)) {
++            _serverPos += bytesWritten;
++        } else {
++            _serverPos = kUnknown;
++        }
++        cache_written(_position, in, bytesWritten);
+         _position += bytesWritten;
+         return bytesWritten;
+     }
+ 
+     bool seek(std::uint64_t offset) override {
+-        bool success = _client->seek(_fileHandle, static_cast<uint32_t>(offset));
+-        if (success) {
+-            _position = offset;
++        if (offset > 0xFFFFFFFFULL) {
++            return false;
+         }
+-        return success;
++        _position = offset;
++        return true;
+     }
+ 
+     std::uint64_t tell() const override {
+@@ -63,10 +122,172 @@ public:
+         return true;
+     }
+ 
++    std::size_t lane_count() const { return _lanes.size(); }
++
++    // Close the read-ahead handles, for good.
++    void drop_lanes() {
++        for (int h : _lanes) {
++            _client->close(h);
++        }
++        if (!_lanes.empty()) {
++            FN_LOGI(TAG, "%s: read-ahead handles given back", _path.c_str());
++        }
++        _lanes.clear();
++        _lanesTried = true;
++    }
++
+ private:
++    struct CacheEntry {
++        std::uint64_t offset{kUnknown};
++        std::uint32_t lastUse{0};
++    };
++
++    bool sync_position() {
++        if (_serverPos == _position) {
++            return true;
++        }
++        if (!_client->seek(_fileHandle, static_cast<std::uint32_t>(_position))) {
++            _serverPos = kUnknown;
++            return false;
++        }
++        _serverPos = _position;
++        return true;
++    }
++
++    CacheEntry* cache_find(std::uint64_t offset) {
++        for (auto& e : _entries) {
++            if (e.offset == offset) {
++                return &e;
++            }
++        }
++        return nullptr;
++    }
++
++    bool cache_get(std::uint64_t offset, std::uint8_t* out) {
++        CacheEntry* e = cache_find(offset);
++        if (!e) {
++            return false;
++        }
++        e->lastUse = ++_useClock;
++        std::memcpy(out, block_data(*e), kBlock);
++        return true;
++    }
++
++    void cache_put(std::uint64_t offset, const std::uint8_t* in) {
++        if (_entries.empty()) {
++            _entries.resize(kCacheBlocks);
++            _data.resize(kCacheBlocks * kBlock);
++        }
++        CacheEntry* e = cache_find(offset);
++        if (!e) {
++            e = &_entries[0];
++            for (auto& c : _entries) {
++                if (c.offset == kUnknown) {
++                    e = &c;
++                    break;
++                }
++                if (c.lastUse < e->lastUse) {
++                    e = &c;
++                }
++            }
++            e->offset = offset;
++        }
++        e->lastUse = ++_useClock;
++        std::memcpy(block_data(*e), in, kBlock);
++    }
++
++    // Keep the cache in step with bytes written at `offset`.
++    void cache_written(std::uint64_t offset, const std::uint8_t* in, std::size_t bytes) {
++        if (_entries.empty() || bytes == 0) {
++            return;
++        }
++        if (bytes == kBlock && offset % kBlock == 0) {
++            if (cache_find(offset)) {
++                cache_put(offset, in);
++            }
++            return;
++        }
++        for (auto& e : _entries) {
++            if (e.offset != kUnknown && e.offset < offset + bytes && offset < e.offset + kBlock) {
++                e.offset = kUnknown;
++            }
++        }
++    }
++
++    std::uint8_t* block_data(const CacheEntry& e) {
++        return _data.data() + static_cast<std::size_t>(&e - _entries.data()) * kBlock;
++    }
++
++    // Fetch the block at `offset` and the uncached blocks after it.
++    bool read_ahead(std::uint64_t offset) {
++        if (!_client->supports_parallel_reads()) {
++            return false;
++        }
++        open_lanes();
++        if (_lanes.empty()) {
++            return false;
++        }
++
++        std::vector<std::uint8_t> buf((_lanes.size() + 1) * kBlock);
++        std::vector<tnfs::ITnfsClient::ReadAt> reads;
++        const std::size_t handles = _lanes.size() + 1;
++        for (std::size_t i = 0; i < kReadAhead && reads.size() < handles; ++i) {
++            const std::uint64_t at = offset + i * kBlock;
++            if (i > 0 && cache_find(at)) {
++                continue;
++            }
++            if (at + kBlock > 0xFFFFFFFFULL) {
++                break;
++            }
++            tnfs::ITnfsClient::ReadAt r;
++            r.fileHandle = reads.empty() ? _fileHandle : _lanes[reads.size() - 1];
++            r.offset = static_cast<std::uint32_t>(at);
++            r.dst = buf.data() + reads.size() * kBlock;
++            r.bytes = kBlock;
++            reads.push_back(r);
++        }
++        _client->read_parallel(reads);
++        _serverPos = kUnknown; // the main handle took part
++
++        bool gotFirst = false;
++        for (const auto& r : reads) {
++            if (r.got == kBlock) {
++                cache_put(r.offset, r.dst);
++                gotFirst = gotFirst || r.offset == offset;
++            }
++        }
++        return gotFirst;
++    }
++
++    void open_lanes() {
++        if (_lanesTried) {
++            return;
++        }
++        _lanesTried = true;
++        // The server limits a session's open files, so take what it gives.
++        for (std::size_t i = 1; i < kReadAhead; ++i) {
++            const int h = _client->open(_path, tnfs::OPENMODE_READ, 0);
++            if (h < 0) {
++                break;
++            }
++            _lanes.push_back(h);
++        }
++        FN_LOGI(TAG, "%s: reading ahead %u blocks at a time", _path.c_str(),
++                static_cast<unsigned>(_lanes.size() + 1));
++    }
++
+     std::shared_ptr<tnfs::ITnfsClient> _client;
+     int _fileHandle;
+-    std::uint64_t _position;
++    std::string _path;
++    bool _cacheable;
++    std::uint64_t _position{0};
++    std::uint64_t _serverPos{0};
++    std::vector<int> _lanes;
++    bool _lanesTried{false};
++    std::vector<CacheEntry> _entries;
++    std::vector<std::uint8_t> _data;
++    std::uint32_t _useClock{0};
++    std::shared_ptr<TnfsOpenFiles> _openFiles;
+ };
+ 
+ class TnfsFileSystem final : public IFileSystem {
+@@ -178,13 +399,33 @@ public:
+             openMode = tnfs::OPENMODE_READ;
+         }
+ 
++        auto& openFiles = _openFiles[resolved.client.get()];
++        if (!openFiles) {
++            openFiles = std::make_shared<TnfsOpenFiles>();
++        }
+         int fileHandle = resolved.client->open(resolved.path, openMode, createPerms);
++        while (fileHandle == -1) {
++            // Perhaps the session is out of handles: free the most read-ahead ones.
++            TnfsFile* most = nullptr;
++            for (TnfsFile* f : openFiles->files) {
++                if (f->lane_count() > 0 && (!most || f->lane_count() > most->lane_count())) {
++                    most = f;
++                }
++            }
++            if (!most) {
++                break;
++            }
++            most->drop_lanes();
++            fileHandle = resolved.client->open(resolved.path, openMode, createPerms);
++        }
+         if (fileHandle == -1) {
+             FN_LOGE(TAG, "Failed to open file: %s", resolved.path.c_str());
+             return nullptr;
+         }
+ 
+-        return std::make_unique<TnfsFile>(resolved.client, fileHandle);
++        // Appends go wherever the file ends, so they skip the block cache.
++        const bool cacheable = std::strchr(mode, 'a') == nullptr;
++        return std::make_unique<TnfsFile>(resolved.client, fileHandle, resolved.path, cacheable, openFiles);
+     }
+ 
+     bool stat(const std::string& path, FileInfo& outInfo) override {
+@@ -506,6 +747,7 @@ private:
+     std::shared_ptr<tnfs::ITnfsClient> _fixedClient;
+     TnfsEndpoint _defaultEndpoint;
+     std::map<SessionKey, Session> _sessions;
++    std::map<const tnfs::ITnfsClient*, std::shared_ptr<TnfsOpenFiles>> _openFiles;
+ };
+ 
+ std::unique_ptr<IFileSystem> make_tnfs_filesystem(std::shared_ptr<tnfs::ITnfsClient> client) {
+diff --git a/src/lib/tnfs/tnfs_udp_client.cpp b/src/lib/tnfs/tnfs_udp_client.cpp
+index 9a0b058..cd2a16d 100644
+--- a/src/lib/tnfs/tnfs_udp_client.cpp
++++ b/src/lib/tnfs/tnfs_udp_client.cpp
+@@ -6,7 +6,9 @@ namespace fujinet::tnfs {
+ 
+ std::unique_ptr<ITnfsClient> make_udp_tnfs_client(std::unique_ptr<fujinet::io::Channel> channel)
+ {
+-    return std::make_unique<CommonTnfsClient>(std::move(channel), "UDP");
++    // Each UDP datagram is a request of its own, so reads on different
++    // handles can be in flight together.
++    return std::make_unique<CommonTnfsClient>(std::move(channel), "UDP", true);
+ }
+ 
+ } // namespace fujinet::tnfs
+diff --git a/tests/test_tnfs_file_cache.cpp b/tests/test_tnfs_file_cache.cpp
+new file mode 100644
+index 0000000..db0d622
+--- /dev/null
++++ b/tests/test_tnfs_file_cache.cpp
+@@ -0,0 +1,239 @@
++#include "doctest.h"
++
++#include "fujinet/fs/tnfs_filesystem.h"
++#include "fujinet/tnfs/tnfs_protocol.h"
++
++#include <algorithm>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++using namespace fujinet::fs;
++using namespace fujinet::tnfs;
++
++namespace {
++
++// A TNFS server in memory: files, per-handle positions, a limit on open
++// files, and counts of the requests that reach it.
++class FakeTnfsServer : public ITnfsClient {
++public:
++    explicit FakeTnfsServer(bool parallel) : _parallel(parallel) {}
++
++    std::map<std::string, std::vector<std::uint8_t>> files;
++    std::size_t maxOpen = 16;
++    int reads = 0, writes = 0, seeks = 0, batches = 0;
++
++    bool mount(const std::string&, const std::string&, const std::string&) override { return true; }
++    bool umount() override { return true; }
++    bool stat(const std::string& path, TnfsStat& st) override
++    {
++        auto it = files.find(path);
++        if (it == files.end()) return false;
++        st = {};
++        st.filesize = static_cast<uint32_t>(it->second.size());
++        return true;
++    }
++    bool exists(const std::string& path) override { return files.count(path) != 0; }
++    bool isDirectory(const std::string&) override { return false; }
++    bool createDirectory(const std::string&) override { return true; }
++    bool removeDirectory(const std::string&) override { return true; }
++    bool removeFile(const std::string&) override { return true; }
++    bool rename(const std::string&, const std::string&) override { return true; }
++    std::vector<std::string> listDirectory(const std::string&) override { return {}; }
++
++    int open(const std::string& path, uint16_t, uint16_t) override
++    {
++        if (!files.count(path) || _handles.size() >= maxOpen) return -1;
++        const int h = _next++;
++        _handles[h] = {path, 0};
++        return h;
++    }
++    bool close(int h) override { return _handles.erase(h) != 0; }
++
++    std::size_t read(int h, void* buf, std::size_t bytes) override
++    {
++        ++reads;
++        return do_read(h, buf, std::min<std::size_t>(bytes, 512));
++    }
++    std::size_t write(int h, const void* buf, std::size_t bytes) override
++    {
++        ++writes;
++        auto& hd = _handles.at(h);
++        auto& f = files[hd.path];
++        bytes = std::min<std::size_t>(bytes, 512);
++        if (hd.pos + bytes > f.size()) f.resize(hd.pos + bytes);
++        std::memcpy(f.data() + hd.pos, buf, bytes);
++        hd.pos += bytes;
++        return bytes;
++    }
++    bool seek(int h, uint32_t offset) override
++    {
++        ++seeks;
++        _handles.at(h).pos = offset;
++        return true;
++    }
++    uint32_t tell(int h) override { return _handles.at(h).pos; }
++
++    bool supports_parallel_reads() const override { return _parallel; }
++    void read_parallel(std::vector<ReadAt>& batch) override
++    {
++        ++batches;
++        for (auto& r : batch) {
++            _handles.at(r.fileHandle).pos = r.offset;
++            r.got = do_read(r.fileHandle, r.dst, r.bytes);
++        }
++    }
++
++    std::size_t open_handles() const { return _handles.size(); }
++
++private:
++    struct Handle {
++        std::string path;
++        uint32_t pos;
++    };
++
++    std::size_t do_read(int h, void* buf, std::size_t bytes)
++    {
++        auto& hd = _handles.at(h);
++        const auto& f = files[hd.path];
++        if (hd.pos >= f.size()) return 0;
++        const std::size_t n = std::min<std::size_t>(bytes, f.size() - hd.pos);
++        std::memcpy(buf, f.data() + hd.pos, n);
++        hd.pos += static_cast<uint32_t>(n);
++        return n;
++    }
++
++    bool _parallel;
++    int _next = 1;
++    std::map<int, Handle> _handles;
++};
++
++std::vector<std::uint8_t> image(std::size_t blocks)
++{
++    std::vector<std::uint8_t> v(blocks * 512);
++    for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<std::uint8_t>(i / 512 * 3 + i);
++    return v;
++}
++
++std::vector<std::uint8_t> read_block(IFile& f, std::size_t block)
++{
++    std::vector<std::uint8_t> out(512);
++    REQUIRE(f.seek(block * 512));
++    REQUIRE(f.read(out.data(), out.size()) == 512);
++    return out;
++}
++
++std::vector<std::uint8_t> slice(const std::vector<std::uint8_t>& v, std::size_t block)
++{
++    return {v.begin() + block * 512, v.begin() + (block + 1) * 512};
++}
++
++} // namespace
++
++TEST_CASE("TnfsFile: a missed block is fetched with the blocks after it")
++{
++    auto server = std::make_shared<FakeTnfsServer>(true);
++    server->files["/img.hda"] = image(64);
++    auto fs = make_tnfs_filesystem(server);
++    auto f = fs->open("/img.hda", "r+b");
++    REQUIRE(f);
++
++    for (std::size_t b = 0; b < 16; ++b) {
++        CHECK(read_block(*f, b) == slice(server->files["/img.hda"], b));
++    }
++    CHECK(server->batches == 2); // blocks 0-7, then 8-15
++    CHECK(server->reads == 0);
++    CHECK(server->open_handles() == 8);
++
++    // Cached blocks cost no request at all, seeks included.
++    const int seeks = server->seeks;
++    CHECK(read_block(*f, 3) == slice(server->files["/img.hda"], 3));
++    CHECK(server->seeks == seeks);
++    CHECK(server->batches == 2);
++
++    // The end of the file: only the blocks that exist are cached.
++    CHECK(read_block(*f, 62) == slice(server->files["/img.hda"], 62));
++    CHECK(read_block(*f, 63) == slice(server->files["/img.hda"], 63));
++    std::uint8_t past[512];
++    REQUIRE(f->seek(64 * 512));
++    CHECK(f->read(past, sizeof(past)) == 0);
++}
++
++TEST_CASE("TnfsFile: writes reach the server and keep the cache in step")
++{
++    auto server = std::make_shared<FakeTnfsServer>(true);
++    server->files["/img.hda"] = image(32);
++    auto fs = make_tnfs_filesystem(server);
++    auto f = fs->open("/img.hda", "r+b");
++    REQUIRE(f);
++
++    read_block(*f, 0); // caches 0-7
++    std::vector<std::uint8_t> ones(512, 0x11);
++    REQUIRE(f->seek(2 * 512));
++    REQUIRE(f->write(ones.data(), ones.size()) == 512);
++    CHECK(slice(server->files["/img.hda"], 2) == ones);
++    CHECK(read_block(*f, 2) == ones);
++
++    // A write that covers part of a cached block drops that block.
++    std::vector<std::uint8_t> bit(100, 0x22);
++    REQUIRE(f->seek(4 * 512 + 10));
++    REQUIRE(f->write(bit.data(), bit.size()) == bit.size());
++    const auto b4 = read_block(*f, 4);
++    CHECK(b4 == slice(server->files["/img.hda"], 4));
++    CHECK(b4[10] == 0x22);
++
++    // A sequential write after a cached read lands at the logical position.
++    read_block(*f, 5);
++    std::vector<std::uint8_t> threes(512, 0x33);
++    REQUIRE(f->write(threes.data(), threes.size()) == 512);
++    CHECK(slice(server->files["/img.hda"], 6) == threes);
++    CHECK(read_block(*f, 6) == threes);
++}
++
++TEST_CASE("TnfsFile: read-ahead handles are given back when the server runs out")
++{
++    auto server = std::make_shared<FakeTnfsServer>(true);
++    server->files["/a.hda"] = image(16);
++    server->files["/b.hda"] = image(16);
++    server->files["/c.hda"] = image(16);
++    auto fs = make_tnfs_filesystem(server);
++
++    auto a = fs->open("/a.hda", "r+b");
++    auto b = fs->open("/b.hda", "r+b");
++    REQUIRE(a);
++    REQUIRE(b);
++    read_block(*a, 0);
++    read_block(*b, 0);
++    CHECK(server->open_handles() == 16);
++
++    auto c = fs->open("/c.hda", "r+b");
++    REQUIRE(c);
++    CHECK(read_block(*c, 9) == slice(server->files["/c.hda"], 9));
++    CHECK(read_block(*a, 12) == slice(server->files["/a.hda"], 12));
++    CHECK(server->open_handles() <= 16);
++
++    a.reset();
++    b.reset();
++    c.reset();
++    CHECK(server->open_handles() == 0);
++}
++
++TEST_CASE("TnfsFile: without parallel reads, blocks are read one by one and cached")
++{
++    auto server = std::make_shared<FakeTnfsServer>(false);
++    server->files["/img.hda"] = image(8);
++    auto fs = make_tnfs_filesystem(server);
++    auto f = fs->open("/img.hda", "rb");
++    REQUIRE(f);
++
++    for (std::size_t b = 0; b < 8; ++b) {
++        CHECK(read_block(*f, b) == slice(server->files["/img.hda"], b));
++    }
++    CHECK(server->reads == 8);
++    CHECK(server->seeks == 0); // sequential from the start: no seek needed
++    CHECK(server->open_handles() == 1);
++    CHECK(read_block(*f, 5) == slice(server->files["/img.hda"], 5));
++    CHECK(server->reads == 8);
++}

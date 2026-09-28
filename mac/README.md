@@ -130,6 +130,8 @@ the volume needs neither.
 | `patches/0006-fujinet-nio-mac-floppy-bus.patch` | NIO: `MacFloppyFramer`, profile `Mac68k`/`MacFloppy`, preset `mac-floppy-tcp-debug`, `.hda/.hfv/.dsk` as 512-byte-block images |
 | `patches/0007-fujinet-nio-lib-mac68k.patch` | fujinet-nio-lib: `mac68k` target (Retro68), `src/platform/mac68k/fn_transport.c` |
 | `patches/0008-fujinet-nio-stdio-read-write-switch.patch` | NIO: a write after a read on a stdio image file landed at the end of the read-ahead buffer (found copying files between two HD20s) |
+| `patches/0009-fujinet-nio-mac-uart-unpaced.patch` | NIO: the Pico link is sent unpaced (the default pacing cost 64 ms per block) |
+| `patches/0010-fujinet-nio-tnfs-block-cache.patch` | NIO: TNFS block cache with 8-block parallel read-ahead over extra handles |
 | `mac/snow/*.patch` | Snow, also committed on branch `fujinet-dcd` of `~/code/snow`: (1) the DCD chain (`dcd.rs`) and `fnrun`, a scripted headless runner; (2) the FujiNet floppy in the external drive; (3) polled mode on the link |
 | `mac/apps/fnprobe` | FujiNetProbe: clock, HTTP GET and a floppy mount through fujinet-nio-lib; a 56 KB Toolbox app |
 | `mac/apps/fndisks` | FujiNet Disks: browse images on NIO, mount into slots 1-5, eject; a 55 KB Toolbox app |
