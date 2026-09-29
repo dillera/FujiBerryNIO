@@ -1,5 +1,5 @@
 diff --git a/include/fujinet/tnfs/tnfs_client_common.h b/include/fujinet/tnfs/tnfs_client_common.h
-index 484d6dc..5005008 100644
+index 484d6dc..ddfcce7 100644
 --- a/include/fujinet/tnfs/tnfs_client_common.h
 +++ b/include/fujinet/tnfs/tnfs_client_common.h
 @@ -4,6 +4,7 @@
@@ -23,7 +23,7 @@ index 484d6dc..5005008 100644
      {
          FN_LOGI(TAG, "%s TNFS client created", _transportName);
      }
-@@ -309,6 +312,65 @@ public:
+@@ -309,6 +312,66 @@ public:
          return pos;
      }
  
@@ -49,7 +49,8 @@ index 484d6dc..5005008 100644
 +            pkts[i].payload[4] = static_cast<std::uint8_t>((reads[i].offset >> 16) & 0xFFU);
 +            pkts[i].payload[5] = static_cast<std::uint8_t>((reads[i].offset >> 24) & 0xFFU);
 +        }
-+        std::vector<bool> ok = exchange_all(pkts, std::vector<std::size_t>(reads.size(), 6), kMaxAttempts);
++        std::vector<bool> ok = exchange_all(pkts, std::vector<std::size_t>(reads.size(), 6), kMaxAttempts,
++                                            kParallelTimeout);
 +
 +        // Read phase, for the handles that are in place. Sent once: a read
 +        // whose reply was lost has moved its handle, so sending it again
@@ -72,7 +73,7 @@ index 484d6dc..5005008 100644
 +        if (readPkts.empty()) {
 +            return;
 +        }
-+        ok = exchange_all(readPkts, std::vector<std::size_t>(readPkts.size(), 3), 1);
++        ok = exchange_all(readPkts, std::vector<std::size_t>(readPkts.size(), 3), 1, kParallelTimeout);
 +        for (std::size_t k = 0; k < which.size(); ++k) {
 +            ReadAt& r = reads[which[k]];
 +            const TnfsPacket& reply = readPkts[k];
@@ -89,12 +90,15 @@ index 484d6dc..5005008 100644
  private:
      static std::uint16_t read_u16le(std::uint8_t lo, std::uint8_t hi)
      {
-@@ -396,13 +458,43 @@ private:
+@@ -396,13 +459,46 @@ private:
          return true;
      }
  
 -    bool send_and_receive(TnfsPacket& pkt, std::size_t payloadSize)
 +    static constexpr std::chrono::milliseconds kTimeoutPerAttempt{1500};
++    // A read-ahead batch gives up on a lost reply sooner: the block that
++    // was asked for is then read on its own, with the full retries.
++    static constexpr std::chrono::milliseconds kParallelTimeout{400};
 +    static constexpr int kMaxAttempts = 3;
 +    static constexpr std::size_t kMinResponseSize = 5;
 +
@@ -123,7 +127,7 @@ index 484d6dc..5005008 100644
 +            }
 +        }
 +    }
-+
+ 
 +    bool is_reply_to(const TnfsPacket& response, std::uint8_t seq) const
 +    {
 +        if (response.sequenceNum != seq) {
@@ -132,13 +136,13 @@ index 484d6dc..5005008 100644
 +        return _sessionId == 0 ||
 +               read_u16le(response.sessionIdL, response.sessionIdH) == _sessionId;
 +    }
- 
++
 +    bool send_and_receive(TnfsPacket& pkt, std::size_t payloadSize)
 +    {
          const std::uint8_t expectedSeq = pkt.sequenceNum;
          std::vector<std::uint8_t> tx(4 + payloadSize);
          std::memcpy(tx.data(), &pkt, tx.size());
-@@ -411,36 +503,59 @@ private:
+@@ -411,36 +507,59 @@ private:
              _channel->write(tx.data(), tx.size());
              const auto deadline = std::chrono::steady_clock::now() + kTimeoutPerAttempt;
  
@@ -167,7 +171,7 @@ index 484d6dc..5005008 100644
 +    // packets. Unanswered packets are sent again, up to `attempts` times in
 +    // all. Returns which packets got a reply.
 +    std::vector<bool> exchange_all(std::vector<TnfsPacket>& pkts, const std::vector<std::size_t>& payloadSizes,
-+                                   int attempts)
++                                   int attempts, std::chrono::milliseconds timeout)
 +    {
 +        std::vector<bool> done(pkts.size(), false);
 +        std::size_t left = pkts.size();
@@ -183,7 +187,7 @@ index 484d6dc..5005008 100644
 -                    if (respSession != _sessionId) {
 -                        continue;
 +            }
-+            const auto deadline = std::chrono::steady_clock::now() + kTimeoutPerAttempt;
++            const auto deadline = std::chrono::steady_clock::now() + timeout;
 +            TnfsPacket response{};
 +            while (left > 0 && receive(response, deadline)) {
 +                for (std::size_t i = 0; i < sent.size(); ++i) {

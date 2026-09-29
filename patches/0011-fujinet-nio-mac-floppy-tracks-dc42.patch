@@ -11,7 +11,7 @@ index 8763341..b56e1ba 100644
          src/lib/disk/ssd_image.cpp
          src/lib/disk_device.cpp
 diff --git a/docs/mac_floppy_bus.md b/docs/mac_floppy_bus.md
-index 9a52428..8c8c221 100644
+index 9a52428..1962e22 100644
 --- a/docs/mac_floppy_bus.md
 +++ b/docs/mac_floppy_bus.md
 @@ -30,11 +30,11 @@ Mac --IWM/DB-19--> drive side (Pico, or an emulator) --UART / TCP--> MacFloppyFr
@@ -34,7 +34,7 @@ index 9a52428..8c8c221 100644
  | `?` | `h` n (see `!`) | how many DCD units (fujinet-nio) |
 -| `#` cyl side | nbits (u32 BE), bits | one GCR track, MSB first (emulators) |
 -| `P` cyl side nbits bits | `p` n | a whole written track; changed sectors are written (emulators) |
-+| `#` cyl side | `#`, nbits (u32 BE), bits | one GCR track, MSB first, encoded from the image on demand |
++| `#` cyl side | `#` cyl side, nbits (u32 BE), bits | one GCR track, MSB first, encoded from the image on demand |
 +| `P` cyl side nbits bits | `p` n | written bits (a whole track, or one captured write); changed sectors are written |
  | `!` | none | polled mode (emulators) |
  
@@ -105,6 +105,31 @@ index 32c21ba..29f15f2 100644
  };
  
  enum class DiskError : std::uint8_t {
+diff --git a/include/fujinet/io/transport/mac_floppy_framer.h b/include/fujinet/io/transport/mac_floppy_framer.h
+index 669395b..87cd037 100644
+--- a/include/fujinet/io/transport/mac_floppy_framer.h
++++ b/include/fujinet/io/transport/mac_floppy_framer.h
+@@ -161,7 +161,7 @@ private:
+     MailboxState _state{Idle};
+ 
+     // Floppy: what the drive side has been told, and the head position.
+-    int _floppyAnnounced{0};                  // sides announced, 0 = none
++    int _floppyAnnounced{-1};                 // sides announced, 0 = none; -1 = not yet (say it once)
+     bool _polled{false};                      // '!': answer '?' only
+     bool _serveFloppy{true};
+     int _head{0};
+diff --git a/include/fujinet/platform/esp32/uart_channel.h b/include/fujinet/platform/esp32/uart_channel.h
+index 85f4f1d..3cdcd7d 100644
+--- a/include/fujinet/platform/esp32/uart_channel.h
++++ b/include/fujinet/platform/esp32/uart_channel.h
+@@ -61,6 +61,7 @@ private:
+     UartPins selected_pins() const;
+     /// Apply `uart_param_config` + `uart_set_pin` for current `_uart_cfg`.
+     bool apply_hw_parameters(const UartPins& uart_pins);
++    void drain_rx();
+     void process_event(const uart_event_t& event);
+     bool _initialized{false};
+     config::UartConfig _uart_cfg{};
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 712de18..8539774 100644
 --- a/src/CMakeLists.txt
@@ -117,6 +142,23 @@ index 712de18..8539774 100644
          lib/disk/raw_image.cpp
          lib/disk/ssd_image.cpp
          lib/disk_device.cpp
+diff --git a/src/app/main_esp32.cpp b/src/app/main_esp32.cpp
+index 603b8f7..c3c4831 100644
+--- a/src/app/main_esp32.cpp
++++ b/src/app/main_esp32.cpp
+@@ -393,6 +393,12 @@ extern "C" void app_main(void)
+     esp_log_level_set("tls_diag",    ESP_LOG_INFO);
+     esp_log_level_set("tnfs_fs",     ESP_LOG_INFO);
+     esp_log_level_set("uart_ch",     ESP_LOG_INFO);
++#if defined(FN_BUILD_ESP32_MAC_FLOPPY)
++    // The console runs at 115200: a diskstats line per block (~17 ms) and a
++    // packet dump per FujiBus call would pace the Mac's disks.
++    esp_log_level_set("diskstats",   ESP_LOG_WARN);
++    esp_log_level_set("fujibus",     ESP_LOG_WARN);
++#endif
+     esp_log_level_set("udp",         ESP_LOG_INFO);
+     
+     // legacy testing
 diff --git a/src/lib/bootstrap.cpp b/src/lib/bootstrap.cpp
 index 0b31778..5a08089 100644
 --- a/src/lib/bootstrap.cpp
@@ -348,44 +390,130 @@ index 1a957d5..550c140 100644
  
      // Creators (blank image creation).
 diff --git a/src/lib/transport/mac_floppy_framer.cpp b/src/lib/transport/mac_floppy_framer.cpp
-index 2c31a26..909106f 100644
+index 2c31a26..c3ca55a 100644
 --- a/src/lib/transport/mac_floppy_framer.cpp
 +++ b/src/lib/transport/mac_floppy_framer.cpp
-@@ -202,8 +202,10 @@ bool MacFloppyFramer::handle_command(Channel& ch)
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
+ #include <cstring>
+ 
+ namespace fujinet::io {
+@@ -125,7 +126,11 @@ void MacFloppyFramer::poll(Channel& ch)
+     if (_rx.empty()) {
+         _rxSizeSeen = 0;
+     } else if (now - _rxLastGrowth > std::chrono::milliseconds(200)) {
+-        FN_LOGW(TAG, "dropping %zu byte(s) of an incomplete command 0x%02X", _rx.size(), _rx.front());
++        char head[3 * 8 + 1] = {};
++        for (std::size_t i = 0; i < _rx.size() && i < 8; ++i) {
++            std::snprintf(head + 3 * i, 4, " %02X", _rx[i]);
++        }
++        FN_LOGW(TAG, "dropping %zu byte(s) of an incomplete command:%s", _rx.size(), head);
+         _rx.clear();
+         _rxSizeSeen = 0;
+     }
+@@ -201,10 +206,17 @@ bool MacFloppyFramer::handle_command(Channel& ch)
+         const int cyl = _rx[1];
          const int side = _rx[2];
          _rx.erase(_rx.begin(), _rx.begin() + 3);
++        const auto started = std::chrono::steady_clock::now();
          const std::vector<std::uint8_t> track = encode_track(cyl, side);
 -        std::uint8_t len[4];
 -        put_be32(len, std::uint32_t(track.size() * 8));
-+        // '#' first: an announcement queued before the reply cannot be
-+        // mistaken for its length.
-+        std::uint8_t len[5] = {'#'};
-+        put_be32(len + 1, std::uint32_t(track.size() * 8));
-         ch.write(len, sizeof(len));
+-        ch.write(len, sizeof(len));
++        FN_LOGI(TAG, "track %d.%d: %zu bytes in %lld ms", cyl, side, track.size(),
++                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now() - started).count()));
++        // '#', the track, then its length: an announcement queued ahead of
++        // the reply, or a reply to an earlier request, cannot be mistaken
++        // for this one.
++        std::uint8_t hdr[7] = {'#', std::uint8_t(cyl), std::uint8_t(side)};
++        put_be32(hdr + 3, std::uint32_t(track.size() * 8));
++        ch.write(hdr, sizeof(hdr));
          if (!track.empty()) {
              ch.write(track.data(), track.size());
+         }
+diff --git a/src/platform/esp32/uart_channel.cpp b/src/platform/esp32/uart_channel.cpp
+index d5b09f7..dd1e1df 100644
+--- a/src/platform/esp32/uart_channel.cpp
++++ b/src/platform/esp32/uart_channel.cpp
+@@ -22,7 +22,7 @@ static constexpr const char* TAG = "uart_ch";
+ 
+ static constexpr int UART_RX_BUF_SIZE = 2048;
+ static constexpr int UART_TX_BUF_SIZE = 0;  // 0 = TX buffer not used, blocking write
+-static constexpr int UART_QUEUE_SIZE = 10;
++static constexpr int UART_QUEUE_SIZE = 64;
+ static constexpr int MAX_FLUSH_WAIT_TICKS = 200;
+ /// HW flow: UART ISR asserts RTS when RX FIFO bytes exceed this threshold.
+ static constexpr int UART_RX_FLOW_THRESH = 112;
+@@ -304,21 +304,32 @@ void UartChannel::updateFIFO()
+     while (xQueueReceive(_uart_queue, &event, 0) == pdTRUE) {
+         process_event(event);
+     }
++    // The driver posts one event per RX interrupt (every 32 bytes). When
++    // the queue is full the ISR drops the event but keeps the bytes, so
++    // take everything the driver holds, not what the events announced.
++    drain_rx();
++}
++
++void UartChannel::drain_rx()
++{
++    std::size_t buffered = 0;
++    if (uart_get_buffered_data_len(_uart_port, &buffered) != ESP_OK || buffered == 0) {
++        return;
++    }
++    const std::size_t old_len = _fifo.size();
++    _fifo.resize(old_len + buffered);
++    int result = uart_read_bytes(_uart_port, &_fifo[old_len], buffered, 0);
++    if (result < 0) {
++        result = 0;
++    }
++    _fifo.resize(old_len + static_cast<std::size_t>(result));
+ }
+ 
+ void UartChannel::process_event(const uart_event_t& event)
+ {
+     switch (event.type) {
+     case UART_DATA:
+-        {
+-            size_t old_len = _fifo.size();
+-            _fifo.resize(old_len + event.size);
+-            int result = uart_read_bytes(_uart_port, &_fifo[old_len], event.size, 0);
+-            if (result < 0) {
+-                result = 0;
+-            }
+-            _fifo.resize(old_len + result);
+-        }
++        drain_rx();
+         break;
+ 
+     case UART_FIFO_OVF:
 diff --git a/tests/test_mac_floppy_framer.cpp b/tests/test_mac_floppy_framer.cpp
-index f48ba0e..81b11b8 100644
+index f48ba0e..eccc080 100644
 --- a/tests/test_mac_floppy_framer.cpp
 +++ b/tests/test_mac_floppy_framer.cpp
-@@ -182,11 +182,12 @@ TEST_CASE("MacFloppyFramer: 800K floppy tracks, write-back and eject")
+@@ -182,11 +182,14 @@ TEST_CASE("MacFloppyFramer: 800K floppy tracks, write-back and eject")
      CHECK(rig.exchange({}) == std::vector<std::uint8_t>{'d', 0x80, 'u'});
  
      auto reply = rig.exchange({'#', 0, 0});
 -    REQUIRE(reply.size() >= 4);
 -    const std::uint32_t nbits = (std::uint32_t(reply[0]) << 24) | (std::uint32_t(reply[1]) << 16) |
 -                                (std::uint32_t(reply[2]) << 8) | reply[3];
-+    REQUIRE(reply.size() >= 5);
++    REQUIRE(reply.size() >= 7);
 +    CHECK(reply[0] == '#');
-+    const std::uint32_t nbits = (std::uint32_t(reply[1]) << 24) | (std::uint32_t(reply[2]) << 16) |
-+                                (std::uint32_t(reply[3]) << 8) | reply[4];
++    CHECK(reply[1] == 0);
++    CHECK(reply[2] == 0);
++    const std::uint32_t nbits = (std::uint32_t(reply[3]) << 24) | (std::uint32_t(reply[4]) << 16) |
++                                (std::uint32_t(reply[5]) << 8) | reply[6];
      CHECK(nbits == mac_gcr_track_bits(0));
 -    std::vector<std::uint8_t> track(reply.begin() + 4, reply.end());
-+    std::vector<std::uint8_t> track(reply.begin() + 5, reply.end());
++    std::vector<std::uint8_t> track(reply.begin() + 7, reply.end());
      REQUIRE(track.size() == nbits / 8);
  
      std::vector<mac_gcr_written_sector> found(24);
-@@ -236,3 +237,66 @@ TEST_CASE("MacFloppyFramer: polled mode sends nothing unasked")
+@@ -236,3 +239,68 @@ TEST_CASE("MacFloppyFramer: polled mode sends nothing unasked")
      CHECK(rig.exchange({}).empty());
      CHECK(rig.exchange({'?'}) == std::vector<std::uint8_t>{'h', 0, 2});
  }
@@ -421,11 +549,13 @@ index f48ba0e..81b11b8 100644
 +
 +    // Cylinder 1, side 1: its sectors come from the data, past the header.
 +    auto reply = rig.exchange({'#', 1, 1});
-+    REQUIRE(reply.size() > 5);
++    REQUIRE(reply.size() > 7);
 +    REQUIRE(reply[0] == '#');
-+    const std::uint32_t nbits = (std::uint32_t(reply[1]) << 24) | (std::uint32_t(reply[2]) << 16) |
-+                                (std::uint32_t(reply[3]) << 8) | reply[4];
-+    std::vector<std::uint8_t> track(reply.begin() + 5, reply.end());
++    CHECK(reply[1] == 1);
++    CHECK(reply[2] == 1);
++    const std::uint32_t nbits = (std::uint32_t(reply[3]) << 24) | (std::uint32_t(reply[4]) << 16) |
++                                (std::uint32_t(reply[5]) << 8) | reply[6];
++    std::vector<std::uint8_t> track(reply.begin() + 7, reply.end());
 +    std::vector<mac_gcr_written_sector> found(24);
 +    const int n = mac_gcr_decode_capture(track.data(), nbits, found.data(), int(found.size()));
 +    REQUIRE(n == mac_gcr_sectors_per_track(1));
